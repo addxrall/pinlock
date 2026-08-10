@@ -6,6 +6,9 @@
 
 static const CGFloat kDimFloor = 0.02;
 
+static const NSInteger kQuitPresses = 4;
+static const NSTimeInterval kQuitWindow = 2.0;
+
 static NSString *currentPIN(void) {
     return [NSUserDefaults.standardUserDefaults stringForKey:@"pin"];
 }
@@ -42,6 +45,38 @@ static BOOL promptForPIN(NSString *title, NSString *info) {
     }
 }
 
+static BOOL quitGestureComplete(NSTimeInterval now) {
+    static NSInteger presses = 0;
+    static NSTimeInterval last = 0;
+
+    if (now - last > kQuitWindow) presses = 0;
+    last = now;
+
+    if (++presses >= kQuitPresses) {
+        presses = 0;
+        return YES;
+    }
+    return NO;
+}
+
+static void selfTest(void) {
+    NSCAssert(kQuitPresses == 4, @"test assumes a 4-press gesture");
+
+    NSCAssert(!quitGestureComplete(0.0), @"1st press must not quit");
+    NSCAssert(!quitGestureComplete(0.5), @"2nd press must not quit");
+    NSCAssert(!quitGestureComplete(1.0), @"3rd press must not quit");
+    NSCAssert(quitGestureComplete(1.5), @"4th press must quit");
+
+    NSCAssert(!quitGestureComplete(10.0), @"after reset, 1st press must not quit");
+    NSCAssert(!quitGestureComplete(10.5), @"2nd press must not quit");
+    NSCAssert(!quitGestureComplete(99.0), @"stale press must restart the count, not quit");
+    NSCAssert(!quitGestureComplete(99.5), @"2nd of new run must not quit");
+    NSCAssert(!quitGestureComplete(100.0), @"3rd of new run must not quit");
+    NSCAssert(quitGestureComplete(100.5), @"4th of new run must quit");
+
+    printf("selftest ok\n");
+}
+
 @class PinPanel;
 
 #pragma mark - Controller
@@ -51,6 +86,7 @@ static BOOL promptForPIN(NSString *title, NSString *info) {
 + (instancetype)shared;
 - (void)lock;
 - (void)unlock;
+- (void)nudge;
 @end
 
 #pragma mark - Shield
@@ -241,6 +277,8 @@ static BOOL promptForPIN(NSString *title, NSString *info) {
                                 NSApplicationPresentationDisableHideApplication;
 }
 
+- (void)nudge { [_panel shake]; }
+
 - (void)unlock {
     if (!_locked) return;
     _locked = NO;
@@ -297,6 +335,29 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
 
     [self registerHotKey];
 
+    __block NSInteger presses = 0;
+    __block NSTimeInterval last = 0;
+    [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown
+                                          handler:^NSEvent *(NSEvent *e) {
+        if (!((e.modifierFlags & NSEventModifierFlagCommand) &&
+              [e.charactersIgnoringModifiers.lowercaseString isEqualToString:@"q"]))
+            return e;
+
+        if (kQuitPresses <= 0) return nil;
+        if (e.isARepeat) return nil;
+
+        if (e.timestamp - last > kQuitWindow) presses = 0;
+        last = e.timestamp;
+
+        if (++presses >= kQuitPresses) {
+            presses = 0;
+            [NSApp terminate:nil];
+        } else {
+            [LockController.shared nudge];
+        }
+        return nil;
+    }];
+
     if (!currentPIN())
         promptForPIN(@"Set a PIN",
                      @"pinlock locks the screen with this PIN. At least 4 digits.");
@@ -328,6 +389,11 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
 
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
+        if (argc > 1 && strcmp(argv[1], "--selftest") == 0) {
+            selfTest();
+            return 0;
+        }
+
         [NSApplication sharedApplication];
         NSApp.activationPolicy = NSApplicationActivationPolicyAccessory;
         static Delegate *del;
