@@ -2,6 +2,7 @@
 #import <Collaboration/Collaboration.h>
 #import <QuartzCore/QuartzCore.h>
 #import <IOKit/pwr_mgt/IOPMLib.h>
+#import <Carbon/Carbon.h>
 
 static const CGFloat kDimFloor = 0.02;
 
@@ -261,6 +262,14 @@ static BOOL promptForPIN(NSString *title, NSString *info) {
 
 #pragma mark - App
 
+static const UInt32 kHotKeyCode = kVK_ANSI_L;
+static const UInt32 kHotKeyMods = controlKey | optionKey | cmdKey;
+
+static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
+    [LockController.shared lock];
+    return noErr;
+}
+
 @interface Delegate : NSObject <NSApplicationDelegate>
 @end
 
@@ -274,16 +283,35 @@ static BOOL promptForPIN(NSString *title, NSString *info) {
                                    accessibilityDescription:@"pinlock"];
 
     NSMenu *menu = [NSMenu new];
-    [menu addItemWithTitle:@"Lock Now" action:@selector(lockNow:) keyEquivalent:@""].target = self;
+    NSMenuItem *lockItem = [menu addItemWithTitle:@"Lock Now"
+                                           action:@selector(lockNow:)
+                                    keyEquivalent:@"l"];
+    lockItem.target = self;
+    lockItem.keyEquivalentModifierMask =
+        NSEventModifierFlagControl | NSEventModifierFlagOption | NSEventModifierFlagCommand;
     [menu addItemWithTitle:@"Change PIN…" action:@selector(changePIN:) keyEquivalent:@""].target = self;
 
     [menu addItem:NSMenuItem.separatorItem];
     [menu addItemWithTitle:@"Quit pinlock" action:@selector(quit:) keyEquivalent:@"q"].target = self;
     _item.menu = menu;
 
+    [self registerHotKey];
+
     if (!currentPIN())
         promptForPIN(@"Set a PIN",
                      @"pinlock locks the screen with this PIN. At least 4 digits.");
+}
+
+- (void)registerHotKey {
+    EventTypeSpec spec = {kEventClassKeyboard, kEventHotKeyPressed};
+    InstallApplicationEventHandler(&onHotKey, 1, &spec, NULL, NULL);
+
+    EventHotKeyID hkid = {'plck', 1};
+    EventHotKeyRef ref = NULL;
+    OSStatus err = RegisterEventHotKey(kHotKeyCode, kHotKeyMods, hkid,
+                                       GetApplicationEventTarget(), 0, &ref);
+    if (err != noErr)
+        NSLog(@"pinlock: hotkey registration failed (%d)", err);
 }
 
 - (void)lockNow:(id)sender { [LockController.shared lock]; }
