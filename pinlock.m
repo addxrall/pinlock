@@ -5,6 +5,13 @@
 #import <ServiceManagement/ServiceManagement.h>
 #import <Carbon/Carbon.h>
 
+static const CGFloat kBlurDefault = 0.6;
+
+static CGFloat blurStrength(void) {
+    NSNumber *v = [NSUserDefaults.standardUserDefaults objectForKey:@"blur"];
+    return v ? v.doubleValue : kBlurDefault;
+}
+
 static const CGFloat kDimFloor = 0.02;
 
 static const NSInteger kQuitPresses = 4;
@@ -251,6 +258,17 @@ static void selfTest(void) {
         ShieldView *shield = [[ShieldView alloc] initWithFrame:bounds];
         w.contentView = shield;
 
+        CGFloat blur = blurStrength();
+        if (blur > 0) {
+            NSVisualEffectView *frost = [[NSVisualEffectView alloc] initWithFrame:bounds];
+            frost.material = NSVisualEffectMaterialFullScreenUI;
+            frost.blendingMode = NSVisualEffectBlendingModeBehindWindow;
+            frost.state = NSVisualEffectStateActive;
+            frost.alphaValue = blur;
+            frost.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+            [shield addSubview:frost];
+        }
+
         if (scr == NSScreen.screens.firstObject) {
             NSView *p = _panel.view;
             p.translatesAutoresizingMaskIntoConstraints = NO;
@@ -315,6 +333,20 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
 @implementation Delegate {
     NSStatusItem *_item;
     NSMenuItem *_login;
+    NSMenu *_blurMenu;
+}
+
+- (NSMenu *)levelMenu:(NSArray<NSString *> *)titles
+                 tags:(NSArray<NSNumber *> *)tags
+               action:(SEL)action {
+    NSMenu *m = [NSMenu new];
+    m.delegate = self;
+    [titles enumerateObjectsUsingBlock:^(NSString *t, NSUInteger i, BOOL *stop) {
+        NSMenuItem *it = [m addItemWithTitle:t action:action keyEquivalent:@""];
+        it.target = self;
+        it.tag = tags[i].integerValue;
+    }];
+    return m;
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)n {
@@ -331,6 +363,11 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
     lockItem.keyEquivalentModifierMask =
         NSEventModifierFlagControl | NSEventModifierFlagOption | NSEventModifierFlagCommand;
     [menu addItemWithTitle:@"Change PIN…" action:@selector(changePIN:) keyEquivalent:@""].target = self;
+
+    _blurMenu = [self levelMenu:@[@"Off", @"Light", @"Medium", @"Full"]
+                           tags:@[@0, @30, @60, @100]
+                         action:@selector(setBlur:)];
+    [menu addItemWithTitle:@"Blur" action:nil keyEquivalent:@""].submenu = _blurMenu;
 
     _login = [menu addItemWithTitle:@"Open at Login"
                              action:@selector(toggleLogin:)
@@ -371,6 +408,13 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
 }
 
 - (void)menuWillOpen:(NSMenu *)menu {
+    if (menu == _blurMenu) {
+        NSInteger cur = lround(blurStrength() * 100);
+        for (NSMenuItem *it in menu.itemArray)
+            it.state = it.tag == cur ? NSControlStateValueOn : NSControlStateValueOff;
+        return;
+    }
+
     if (@available(macOS 13.0, *))
         _login.state = SMAppService.mainAppService.status == SMAppServiceStatusEnabled
                            ? NSControlStateValueOn
@@ -402,6 +446,10 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
         if (err) [self alertWithText:@"Could not change the login item"
                                 info:err.localizedDescription];
     }
+}
+
+- (void)setBlur:(NSMenuItem *)sender {
+    [NSUserDefaults.standardUserDefaults setDouble:sender.tag / 100.0 forKey:@"blur"];
 }
 
 - (void)changePIN:(id)sender {
