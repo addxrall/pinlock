@@ -2,6 +2,7 @@
 #import <Collaboration/Collaboration.h>
 #import <QuartzCore/QuartzCore.h>
 #import <IOKit/pwr_mgt/IOPMLib.h>
+#import <ServiceManagement/ServiceManagement.h>
 #import <Carbon/Carbon.h>
 
 static const CGFloat kDimFloor = 0.02;
@@ -308,11 +309,12 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
     return noErr;
 }
 
-@interface Delegate : NSObject <NSApplicationDelegate>
+@interface Delegate : NSObject <NSApplicationDelegate, NSMenuDelegate>
 @end
 
 @implementation Delegate {
     NSStatusItem *_item;
+    NSMenuItem *_login;
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)n {
@@ -321,6 +323,7 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
                                    accessibilityDescription:@"pinlock"];
 
     NSMenu *menu = [NSMenu new];
+    menu.delegate = self;
     NSMenuItem *lockItem = [menu addItemWithTitle:@"Lock Now"
                                            action:@selector(lockNow:)
                                     keyEquivalent:@"l"];
@@ -329,6 +332,10 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
         NSEventModifierFlagControl | NSEventModifierFlagOption | NSEventModifierFlagCommand;
     [menu addItemWithTitle:@"Change PIN…" action:@selector(changePIN:) keyEquivalent:@""].target = self;
 
+    _login = [menu addItemWithTitle:@"Open at Login"
+                             action:@selector(toggleLogin:)
+                      keyEquivalent:@""];
+    _login.target = self;
     [menu addItem:NSMenuItem.separatorItem];
     [menu addItemWithTitle:@"Quit pinlock" action:@selector(quit:) keyEquivalent:@"q"].target = self;
     _item.menu = menu;
@@ -363,6 +370,15 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
                      @"pinlock locks the screen with this PIN. At least 4 digits.");
 }
 
+- (void)menuWillOpen:(NSMenu *)menu {
+    if (@available(macOS 13.0, *))
+        _login.state = SMAppService.mainAppService.status == SMAppServiceStatusEnabled
+                           ? NSControlStateValueOn
+                           : NSControlStateValueOff;
+    else
+        _login.hidden = YES;
+}
+
 - (void)registerHotKey {
     EventTypeSpec spec = {kEventClassKeyboard, kEventHotKeyPressed};
     InstallApplicationEventHandler(&onHotKey, 1, &spec, NULL, NULL);
@@ -377,8 +393,27 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
 
 - (void)lockNow:(id)sender { [LockController.shared lock]; }
 
+- (void)toggleLogin:(id)sender {
+    if (@available(macOS 13.0, *)) {
+        BOOL on = SMAppService.mainAppService.status == SMAppServiceStatusEnabled;
+        NSError *err = nil;
+        if (on) [SMAppService.mainAppService unregisterAndReturnError:&err];
+        else [SMAppService.mainAppService registerAndReturnError:&err];
+        if (err) [self alertWithText:@"Could not change the login item"
+                                info:err.localizedDescription];
+    }
+}
+
 - (void)changePIN:(id)sender {
     promptForPIN(@"Change PIN", @"At least 4 digits. You will need this to unlock the screen.");
+}
+
+- (void)alertWithText:(NSString *)text info:(NSString *)info {
+    NSAlert *a = [NSAlert new];
+    a.messageText = text;
+    a.informativeText = info;
+    [NSApp activateIgnoringOtherApps:YES];
+    [a runModal];
 }
 
 - (void)quit:(id)sender { [NSApp terminate:nil]; }
