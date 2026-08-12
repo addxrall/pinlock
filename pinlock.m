@@ -12,6 +12,34 @@ static CGFloat blurStrength(void) {
     return v ? v.doubleValue : kBlurDefault;
 }
 
+static const CGFloat kDimDefault = 0.0;
+
+static CGFloat dimStrength(void) {
+    NSNumber *v = [NSUserDefaults.standardUserDefaults objectForKey:@"dim"];
+    return v ? v.doubleValue : kDimDefault;
+}
+
+static NSArray<NSString *> *tintNames(void) {
+    return @[@"Black", @"Grey", @"Blue", @"Purple", @"Red"];
+}
+
+static NSColor *tintColor(NSString *name) {
+    static NSDictionary<NSString *, NSColor *> *map;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        map = @{@"Black":  NSColor.blackColor,
+                @"Grey":   [NSColor colorWithWhite:0.45 alpha:1],
+                @"Blue":   [NSColor colorWithRed:0.04 green:0.09 blue:0.28 alpha:1],
+                @"Purple": [NSColor colorWithRed:0.14 green:0.04 blue:0.26 alpha:1],
+                @"Red":    [NSColor colorWithRed:0.28 green:0.03 blue:0.05 alpha:1]};
+    });
+    return map[name] ?: NSColor.blackColor;
+}
+
+static NSString *currentTint(void) {
+    return [NSUserDefaults.standardUserDefaults stringForKey:@"tint"] ?: @"Black";
+}
+
 static const CGFloat kDimFloor = 0.02;
 
 static const NSInteger kQuitPresses = 4;
@@ -258,8 +286,8 @@ static void selfTest(void) {
         ShieldView *shield = [[ShieldView alloc] initWithFrame:bounds];
         w.contentView = shield;
 
-        CGFloat blur = blurStrength();
-        if (blur > 0) {
+        CGFloat blur = blurStrength(), dim = dimStrength();
+        if (blur > 0 && dim < 1.0) {
             NSVisualEffectView *frost = [[NSVisualEffectView alloc] initWithFrame:bounds];
             frost.material = NSVisualEffectMaterialFullScreenUI;
             frost.blendingMode = NSVisualEffectBlendingModeBehindWindow;
@@ -267,6 +295,15 @@ static void selfTest(void) {
             frost.alphaValue = blur;
             frost.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
             [shield addSubview:frost];
+        }
+
+        if (dim > 0) {
+            NSView *cover = [[NSView alloc] initWithFrame:bounds];
+            cover.wantsLayer = YES;
+            cover.layer.backgroundColor =
+                [tintColor(currentTint()) colorWithAlphaComponent:dim].CGColor;
+            cover.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+            [shield addSubview:cover];
         }
 
         if (scr == NSScreen.screens.firstObject) {
@@ -333,7 +370,7 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
 @implementation Delegate {
     NSStatusItem *_item;
     NSMenuItem *_login;
-    NSMenu *_blurMenu;
+    NSMenu *_blurMenu, *_dimMenu, *_tintMenu;
 }
 
 - (NSMenu *)levelMenu:(NSArray<NSString *> *)titles
@@ -368,6 +405,19 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
                            tags:@[@0, @30, @60, @100]
                          action:@selector(setBlur:)];
     [menu addItemWithTitle:@"Blur" action:nil keyEquivalent:@""].submenu = _blurMenu;
+
+    _dimMenu = [self levelMenu:@[@"Off", @"Light", @"Heavy", @"Solid (hide desktop)"]
+                          tags:@[@0, @30, @60, @100]
+                        action:@selector(setDim:)];
+    [menu addItemWithTitle:@"Cover" action:nil keyEquivalent:@""].submenu = _dimMenu;
+
+    _tintMenu = [NSMenu new];
+    _tintMenu.delegate = self;
+    for (NSString *name in tintNames())
+        [_tintMenu addItemWithTitle:name
+                             action:@selector(setTint:)
+                      keyEquivalent:@""].target = self;
+    [menu addItemWithTitle:@"Cover Colour" action:nil keyEquivalent:@""].submenu = _tintMenu;
 
     _login = [menu addItemWithTitle:@"Open at Login"
                              action:@selector(toggleLogin:)
@@ -408,10 +458,17 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
 }
 
 - (void)menuWillOpen:(NSMenu *)menu {
-    if (menu == _blurMenu) {
-        NSInteger cur = lround(blurStrength() * 100);
+    if (menu == _blurMenu || menu == _dimMenu) {
+        NSInteger cur = lround((menu == _blurMenu ? blurStrength() : dimStrength()) * 100);
         for (NSMenuItem *it in menu.itemArray)
             it.state = it.tag == cur ? NSControlStateValueOn : NSControlStateValueOff;
+        return;
+    }
+
+    if (menu == _tintMenu) {
+        for (NSMenuItem *it in menu.itemArray)
+            it.state = [it.title isEqualToString:currentTint()] ? NSControlStateValueOn
+                                                                : NSControlStateValueOff;
         return;
     }
 
@@ -450,6 +507,14 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
 
 - (void)setBlur:(NSMenuItem *)sender {
     [NSUserDefaults.standardUserDefaults setDouble:sender.tag / 100.0 forKey:@"blur"];
+}
+
+- (void)setDim:(NSMenuItem *)sender {
+    [NSUserDefaults.standardUserDefaults setDouble:sender.tag / 100.0 forKey:@"dim"];
+}
+
+- (void)setTint:(NSMenuItem *)sender {
+    [NSUserDefaults.standardUserDefaults setObject:sender.title forKey:@"tint"];
 }
 
 - (void)changePIN:(id)sender {
