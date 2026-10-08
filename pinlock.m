@@ -81,6 +81,13 @@ static BOOL promptForPIN(NSString *title, NSString *info) {
     }
 }
 
+static NSString *pinDigits(NSString *s, NSUInteger max) {
+    NSString *d = [[s componentsSeparatedByCharactersInSet:
+                          NSCharacterSet.decimalDigitCharacterSet.invertedSet]
+                      componentsJoinedByString:@""];
+    return d.length > max ? [d substringToIndex:max] : d;
+}
+
 static BOOL quitGestureComplete(NSTimeInterval now) {
     static NSInteger presses = 0;
     static NSTimeInterval last = 0;
@@ -109,6 +116,10 @@ static void selfTest(void) {
     NSCAssert(!quitGestureComplete(99.5), @"2nd of new run must not quit");
     NSCAssert(!quitGestureComplete(100.0), @"3rd of new run must not quit");
     NSCAssert(quitGestureComplete(100.5), @"4th of new run must quit");
+
+    NSCAssert([pinDigits(@"12a3", 6) isEqualToString:@"123"], @"non-digits must be dropped");
+    NSCAssert([pinDigits(@"1234567", 4) isEqualToString:@"1234"], @"input must stop at PIN length");
+    NSCAssert([pinDigits(@"", 4) isEqualToString:@""], @"empty stays empty");
 
     printf("selftest ok\n");
 }
@@ -150,7 +161,34 @@ static void selfTest(void) {
 
 #pragma mark - PIN panel
 
-@interface PinPanel : NSViewController
+@interface PinBox : NSView
+@property (nonatomic) BOOL filled, active;
+@end
+
+@implementation PinBox
+
+- (NSSize)intrinsicContentSize { return NSMakeSize(36, 44); }
+
+- (void)drawRect:(NSRect)r {
+    NSBezierPath *p = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(self.bounds, 1, 1)
+                                                      xRadius:8
+                                                      yRadius:8];
+    [[NSColor.labelColor colorWithAlphaComponent:0.06] setFill];
+    [p fill];
+    p.lineWidth = _active ? 2 : 1;
+    [(_active ? NSColor.controlAccentColor : NSColor.tertiaryLabelColor) setStroke];
+    [p stroke];
+
+    if (_filled) {
+        NSRect b = self.bounds;
+        [NSColor.labelColor setFill];
+        [[NSBezierPath bezierPathWithOvalInRect:NSMakeRect(NSMidX(b) - 5, NSMidY(b) - 5, 10, 10)] fill];
+    }
+}
+
+@end
+
+@interface PinPanel : NSViewController <NSTextFieldDelegate>
 @property (nonatomic, readonly) NSSecureTextField *field;
 - (void)shake;
 @end
@@ -158,6 +196,7 @@ static void selfTest(void) {
 @implementation PinPanel {
     NSVisualEffectView *_blur;
     NSSecureTextField *_field;
+    NSArray<PinBox *> *_boxes;
 }
 
 - (void)loadView {
@@ -180,30 +219,65 @@ static void selfTest(void) {
     name.font = [NSFont systemFontOfSize:17 weight:NSFontWeightMedium];
     name.alignment = NSTextAlignmentCenter;
 
+    // The secure field stays the real input (keeps Secure Event Input on);
+    // it sits invisibly on top of the boxes, which only mirror its length.
+    NSMutableArray<PinBox *> *boxes = [NSMutableArray array];
+    for (NSUInteger i = 0; i < currentPIN().length; i++) [boxes addObject:[PinBox new]];
+    _boxes = boxes;
+    NSStackView *row = [NSStackView stackViewWithViews:boxes];
+    row.spacing = 8;
+
     _field = [[NSSecureTextField alloc] initWithFrame:NSZeroRect];
-    _field.bezelStyle = NSTextFieldRoundedBezel;
-    _field.alignment = NSTextAlignmentCenter;
-    _field.placeholderString = @"Enter PIN";
+    _field.bezeled = NO;
+    _field.focusRingType = NSFocusRingTypeNone;
+    _field.alphaValue = 0;
+    _field.delegate = self;
     _field.target = self;
     _field.action = @selector(submit:);
     _field.nextKeyView = _field;
+    _field.translatesAutoresizingMaskIntoConstraints = NO;
 
-    NSStackView *stack = [NSStackView stackViewWithViews:@[avatar, name, _field]];
+    NSStackView *stack = [NSStackView stackViewWithViews:@[avatar, name, row]];
     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
     stack.alignment = NSLayoutAttributeCenterX;
     stack.spacing = 18;
     stack.translatesAutoresizingMaskIntoConstraints = NO;
     [_blur addSubview:stack];
+    [_blur addSubview:_field];
 
+    CGFloat rowWidth = boxes.count * 44.0 - 8;
     [NSLayoutConstraint activateConstraints:@[
         [avatar.widthAnchor constraintEqualToConstant:96],
         [avatar.heightAnchor constraintEqualToConstant:96],
-        [_field.widthAnchor constraintEqualToConstant:200],
+        [_field.leadingAnchor constraintEqualToAnchor:row.leadingAnchor],
+        [_field.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
+        [_field.topAnchor constraintEqualToAnchor:row.topAnchor],
+        [_field.bottomAnchor constraintEqualToAnchor:row.bottomAnchor],
         [stack.centerXAnchor constraintEqualToAnchor:_blur.centerXAnchor],
         [stack.centerYAnchor constraintEqualToAnchor:_blur.centerYAnchor],
-        [_blur.widthAnchor constraintEqualToConstant:300],
+        [_blur.widthAnchor constraintEqualToConstant:MAX(300, rowWidth + 60)],
         [_blur.heightAnchor constraintEqualToConstant:320],
     ]];
+    [self refresh];
+}
+
+- (void)refresh {
+    NSUInteger len = _field.stringValue.length;
+    [_boxes enumerateObjectsUsingBlock:^(PinBox *b, NSUInteger i, BOOL *stop) {
+        b.filled = i < len;
+        b.active = i == len;
+        b.needsDisplay = YES;
+    }];
+}
+
+- (void)controlTextDidChange:(NSNotification *)n {
+    NSString *pin = pinDigits(_field.stringValue, _boxes.count);
+    if (![pin isEqualToString:_field.stringValue]) _field.stringValue = pin;
+    [self refresh];
+    // Deferred so the last box paints before unlock/shake, and so unlock
+    // doesn't free the panel while the field editor is still calling us.
+    if (pin.length == _boxes.count)
+        dispatch_async(dispatch_get_main_queue(), ^{ [self submit:nil]; });
 }
 
 - (NSImage *)accountImage {
@@ -218,6 +292,7 @@ static void selfTest(void) {
         return;
     }
     _field.stringValue = @"";
+    [self refresh];
     [self shake];
 }
 
