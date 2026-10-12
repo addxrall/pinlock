@@ -5,7 +5,7 @@ Menu bar kiosk lock for macOS. While locked the screen stays awake and visible, 
 <p>
   <img src="docs/menu.png" alt="pinlock menu bar menu" width="264">
   &nbsp;
-  <img src="docs/lock-when-away.png" alt="Lock When Away window: the Mac in the middle, nearby devices with icons placed by estimated distance on metre rings, the dashed ring marks the lock distance" width="403">
+  <img src="docs/lock-when-away.png" alt="Lock When Away window: the Mac in the middle, nearby devices with icons placed by estimated distance on metre rings, the dashed ring marks the lock distance" width="404">
 </p>
 
 ## What it is, and what it isn't
