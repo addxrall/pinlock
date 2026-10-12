@@ -5,6 +5,8 @@
 #import <ServiceManagement/ServiceManagement.h>
 #import <Carbon/Carbon.h>
 #import <CoreBluetooth/CoreBluetooth.h>
+#import <CoreMotion/CoreMotion.h>
+#import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <stdatomic.h>
 
 static const CGFloat kBlurDefault = 0.6;
@@ -48,14 +50,42 @@ static const CGFloat kDimFloor = 0.02;
 // watchdog kills the process so a hung pinlock can never trap the user.
 static const uint64_t kStallLimit = 10;
 
-static const NSInteger kAwayRSSIDefault = -70;
 static const NSTimeInterval kAwayDelay = 15;
-static const NSInteger kDistances[] = {-60, -70, -80};  // Close, Medium, Far
+static const double kDistances[] = {1, 2, 3, 5, 8};  // metres offered in the window
 
-static NSInteger awayRSSI(void) {
-    NSNumber *v = [NSUserDefaults.standardUserDefaults objectForKey:@"awayRSSI"];
-    return v ? v.integerValue : kAwayRSSIDefault;
+// Distance from signal strength with the log-distance path-loss model, anchored
+// at "where you sit" (calibrated, pocket and all) instead of a lab 1 m figure.
+// ponytail: a model with fixed n = 2.5; real rooms vary, calibration absorbs most of it.
+static const double kDeskMeters = 0.5, kPathLoss = 25;  // 10·n
+
+static NSInteger awayRef(void) {  // typical RSSI where you sit
+    NSNumber *v = [NSUserDefaults.standardUserDefaults objectForKey:@"awayRef"];
+    return v ? v.integerValue : -55;
 }
+
+static double awayMeters(void) {
+    NSNumber *v = [NSUserDefaults.standardUserDefaults objectForKey:@"awayMeters"];
+    return v ? v.doubleValue : 3;
+}
+
+static double metersFor(NSInteger rssi, NSInteger ref) {
+    return kDeskMeters * pow(10, (ref - rssi) / kPathLoss);
+}
+
+static NSInteger rssiFor(double meters, NSInteger ref) {
+    return lround(ref - kPathLoss * log10(meters / kDeskMeters));
+}
+
+// Watched devices, uuid -> name. Any one of them nearby means you are here.
+static NSDictionary<NSString *, NSString *> *awayDevices(void) {
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    NSDictionary *v = [d dictionaryForKey:@"awayDevices"];
+    if (v) return v;
+    NSString *old = [d stringForKey:@"awayID"];  // single-device setting from before
+    return old ? @{old: [d stringForKey:@"awayName"] ?: @"Device"} : @{};
+}
+
+static NSInteger awayRSSI(void) { return rssiFor(awayMeters(), awayRef()); }
 
 // Phone counts as near while any reading is at or above the threshold; lock
 // once no near reading has arrived for kAwayDelay. Fires once per absence, so
@@ -78,10 +108,169 @@ static BOOL awayDue(Away *a, NSTimeInterval now) {
     return YES;
 }
 
+static const NSTimeInterval kTurnDelay = 0.3;
+static const NSTimeInterval kRecentreTime = 30;
+
+static NSInteger lookAwayAngle(void) {  // degrees, 0 = off
+    return [NSUserDefaults.standardUserDefaults integerForKey:@"lookAway"];
+}
+
+// Head yaw against a "facing the screen" baseline. Blur once the head stays
+// turned past the limit for kTurnDelay; clear once back inside 70% of it.
+// While facing the screen the baseline slowly follows the head, soaking up
+// sensor drift and posture changes but not a deliberate turn.
+typedef struct {
+    double yaw0, yaw;
+    NSTimeInterval turnedAt, last;
+    BOOL started, turning, blurred;
+    int side;  // which way the head turned: +1 right, -1 left
+} Head;
+
+static BOOL headSample(Head *h, double yaw, double limit, NSTimeInterval now) {
+    if (!h->started) {
+        h->yaw0 = yaw;
+        h->last = now;
+        h->started = YES;
+    }
+    h->yaw = yaw;
+    double d = remainder(yaw - h->yaw0, 2 * M_PI);  // wraps to ±180°
+    if (fabs(d) > limit) {
+        if (!h->turning) {
+            h->turning = YES;
+            h->turnedAt = now;
+        }
+        if (now - h->turnedAt >= kTurnDelay) h->blurred = YES;
+        // In the headphones' frame a positive yaw is a turn to the right
+        // (checked by ear: the other way round the blur came from the wrong side).
+        h->side = d > 0 ? 1 : -1;
+    } else {
+        h->turning = NO;
+        if (fabs(d) < limit * 0.7) h->blurred = NO;
+        if (!h->blurred && fabs(d) < limit * 0.5)
+            h->yaw0 += d * MIN((now - h->last) / kRecentreTime, 1);
+    }
+    h->last = now;
+    return h->blurred;
+}
+
+// Wherever the head points now becomes "facing the screen".
+static void headRecentre(Head *h) {
+    h->yaw0 = h->yaw;
+    h->turning = h->blurred = NO;
+}
+
+static const NSTimeInterval kPeekIn = 0.7, kPeekOut = 0.5;
+static const double kPeekDim = 0.3;
+enum { kBlurLevels = 4 };
+static const double kBlurSigma[kBlurLevels] = {3, 8, 16, 32};  // points; the last is full strength
+
+// iPhone Duo-style blur, after empirical.health's reconstruction of the fold:
+// strength grows with distance from the hinge as d³. At progress e the first
+// half grows that profile from the turned-to edge; the second half fills in
+// towards the sharp side until the whole screen is at full strength (0..1).
+static double duoBlur(double e, double d) {
+    double grow = MIN(1, 2 * e), fill = MAX(0, 2 * e - 1), d3 = d * d * d;
+    return MIN(1, grow * d3 + fill * (1 - d3));
+}
+
+// Blur levels are stacked weakest to strongest; level k covers the part of
+// the strength range between the level below it and its own sigma.
+static double blurLevelAlpha(double strength, int k) {
+    double lo = k ? kBlurSigma[k - 1] : 0, hi = kBlurSigma[k], s = strength * kBlurSigma[kBlurLevels - 1];
+    return MIN(MAX((s - lo) / (hi - lo), 0), 1);
+}
+
+static CGImageRef maskStrip(const uint8_t *alpha, int n) {
+    CGContextRef c = CGBitmapContextCreate(NULL, n, 1, 8, n, NULL, (CGBitmapInfo)kCGImageAlphaOnly);
+    memcpy(CGBitmapContextGetData(c), alpha, n);
+    CGImageRef img = CGBitmapContextCreateImage(c);
+    CGContextRelease(c);
+    return img;
+}
+
 static BOOL isApple(NSDictionary *ad) {
     NSData *m = ad[CBAdvertisementDataManufacturerDataKey];
     const uint8_t *b = m.bytes;
     return m.length >= 2 && b[0] == 0x4C && b[1] == 0x00;  // Bluetooth SIG company id 0x004C
+}
+
+// What a nearby device is, as an SF Symbol name (plus a fallback label for
+// devices that don't advertise a name). Three sources, most reliable first:
+// Apple's Continuity adverts, the GATT model string, then name and services.
+
+// Continuity adverts are type-length-value messages after the 0x004C id.
+static NSString *appleKind(NSData *m, NSString **label) {
+    const uint8_t *b = m.bytes;
+    for (NSUInteger i = 2; i + 2 <= m.length; i += 2 + b[i + 1]) {
+        uint8_t type = b[i], len = b[i + 1];
+        const uint8_t *v = b + i + 2;
+        if (i + 2 + len > m.length) break;
+
+        if (type == 0x07 && len >= 3) {  // proximity pairing: AirPods and Beats
+            uint16_t model = v[1] << 8 | v[2];
+            switch (model) {
+                case 0x0A20: case 0x1F20:
+                    *label = @"AirPods Max";
+                    return @"airpodsmax";
+                case 0x0E20: case 0x1420: case 0x2420:
+                    *label = @"AirPods Pro";
+                    return @"airpodspro";
+                case 0x0220: case 0x0F20: case 0x1320: case 0x1920: case 0x1B20:
+                    *label = @"AirPods";
+                    return @"airpods";
+                default:
+                    *label = @"Beats";
+                    return @"headphones";
+            }
+        }
+        if (type == 0x12) {  // Find My offline finding
+            *label = @"Find My accessory";
+            return @"airtag";
+        }
+    }
+    return nil;
+}
+
+// Device Information model number, e.g. "iPhone15,2" or "AudioAccessory5,1".
+static NSString *modelKind(NSString *model, NSString **label) {
+    for (NSArray<NSString *> *m in @[
+             @[@"iPhone", @"iphone", @"iPhone"], @[@"iPad", @"ipad", @"iPad"],
+             @[@"Watch", @"applewatch", @"Apple Watch"], @[@"AudioAccessory", @"homepod", @"HomePod"],
+             @[@"AppleTV", @"appletv", @"Apple TV"], @[@"iMac", @"desktopcomputer", @"iMac"],
+             @[@"Mac", @"laptopcomputer", @"Mac"],
+         ])
+        if ([model hasPrefix:m[0]]) {
+            *label = m[2];
+            return m[1];
+        }
+    return nil;
+}
+
+// ponytail: keyword guesses; brands name things freely, add words as they turn up.
+static NSString *nameKind(NSString *name) {
+    NSString *n = name.lowercaseString;
+    for (NSArray<NSString *> *m in @[
+             @[@"airpods max", @"airpodsmax"], @[@"airpods pro", @"airpodspro"], @[@"airpods", @"airpods"],
+             @[@"iphone", @"iphone"], @[@"ipad", @"ipad"], @[@"macbook", @"laptopcomputer"],
+             @[@"imac", @"desktopcomputer"], @[@"homepod", @"homepod"], @[@"watch", @"applewatch"],
+             @[@"keyboard", @"keyboard"], @[@"mouse", @"computermouse"],
+             @[@"speaker", @"hifispeaker"], @[@"jbl", @"hifispeaker"], @[@"soundlink", @"hifispeaker"],
+             @[@"sonos", @"hifispeaker"], @[@"marshall", @"hifispeaker"], @[@"boom", @"hifispeaker"],
+             @[@"buds", @"earbuds"], @[@"wf-", @"earbuds"], @[@"headphone", @"headphones"],
+             @[@"wh-", @"headphones"], @[@"beats", @"headphones"], @[@"bose", @"headphones"],
+             @[@"jabra", @"headphones"], @[@"band", @"applewatch"], @[@"garmin", @"applewatch"],
+             @[@"fitbit", @"applewatch"], @[@"galaxy", @"iphone"], @[@"pixel", @"iphone"],
+             @[@"phone", @"iphone"], @[@"tv", @"tv"],
+         ])
+        if ([n containsString:m[0]]) return m[1];
+    return nil;
+}
+
+static NSString *serviceKind(NSArray<CBUUID *> *services) {
+    NSDictionary *map = @{@"1812": @"keyboard", @"180D": @"heart", @"FE2C": @"headphones"};
+    for (CBUUID *u in services)
+        if (map[u.UUIDString]) return map[u.UUIDString];
+    return nil;
 }
 
 static BOOL macPasswordOK(NSString *password) {
@@ -149,6 +338,66 @@ static void selfTest(void) {
     awaySeen(&a, -60, -70, 50);
     NSCAssert(!awayDue(&a, 60), @"back in range must not lock");
     NSCAssert(awayDue(&a, 66), @"leaving again must lock again");
+
+    double deg = M_PI / 180, limit = 45 * deg;
+    Head h = {0};
+    NSCAssert(!headSample(&h, 0, limit, 1), @"start counts as facing the screen");
+    NSCAssert(!headSample(&h, 60 * deg, limit, 1.1), @"a turn must wait kTurnDelay");
+    NSCAssert(headSample(&h, 60 * deg, limit, 1.5), @"a held turn must blur");
+    NSCAssert(h.side == 1, @"positive yaw is a turn to the right");
+    NSCAssert(headSample(&h, 40 * deg, limit, 1.6), @"just inside the limit stays blurred");
+    NSCAssert(!headSample(&h, 10 * deg, limit, 1.7), @"facing the screen again must clear");
+    NSCAssert(!headSample(&h, 60 * deg, limit, 2.0), @"glance starts");
+    NSCAssert(!headSample(&h, 0, limit, 2.2), @"a quick glance must not blur");
+
+
+    NSCAssert(duoBlur(0, 1) == 0 && duoBlur(0, 0) == 0, @"starts sharp");
+    NSCAssert(duoBlur(0.5, 1) == 1 && duoBlur(0.5, 0) == 0, @"halfway: Duo profile, sharp at the hinge");
+    NSCAssert(duoBlur(0.5, 0.5) < 0.2, @"the profile is steep (d³), not linear");
+    NSCAssert(duoBlur(1, 0) == 1 && duoBlur(1, 0.3) == 1, @"ends fully blurred everywhere");
+    NSCAssert(blurLevelAlpha(1, kBlurLevels - 1) == 1 && blurLevelAlpha(0, 0) == 0, @"level ends");
+    NSCAssert(blurLevelAlpha(8.0 / 32, 1) == 1 && blurLevelAlpha(8.0 / 32, 2) == 0, @"levels hand over");
+
+    Head wrap = {0};
+    headSample(&wrap, 170 * deg, limit, 1);
+    NSCAssert(!headSample(&wrap, -170 * deg, limit, 2), @"yaw must wrap at ±180°");
+
+    Head drift = {0};
+    for (int i = 0; i <= 1800; i++)  // 20° of drift over 60 s, then still for 2 min
+        headSample(&drift, MIN(i / 600.0, 1) * 20 * deg, limit, i * 0.1);
+    headSample(&drift, 60 * deg, limit, 181);
+    NSCAssert(!headSample(&drift, 60 * deg, limit, 182), @"baseline must follow slow drift");
+
+    Head slow = {0};
+    for (int i = 0; i <= 180; i++)  // a slow but deliberate 90° turn at 5°/s
+        headSample(&slow, i * 0.5 * deg, limit, i * 0.1);
+    NSCAssert(headSample(&slow, 90 * deg, limit, 19), @"a slow turn must still blur");
+    headRecentre(&slow);
+    NSCAssert(!headSample(&slow, 90 * deg, limit, 20), @"recentred direction counts as facing");
+
+    NSCAssert(rssiFor(kDeskMeters, -60) == -60, @"the calibrated spot is the reference");
+    NSCAssert(rssiFor(5, -60) < rssiFor(1, -60), @"farther means weaker");
+    NSCAssert(fabs(metersFor(rssiFor(3, -72), -72) - 3) < 0.2, @"metres and RSSI must round-trip");
+
+    NSString *label = nil;
+    uint8_t max[] = {0x4C, 0x00, 0x07, 0x04, 0x01, 0x0A, 0x20, 0x55};
+    NSCAssert([appleKind([NSData dataWithBytes:max length:8], &label) isEqual:@"airpodsmax"] &&
+                  [label isEqual:@"AirPods Max"], @"AirPods Max model id");
+    uint8_t beats[] = {0x4C, 0x00, 0x07, 0x03, 0x01, 0x12, 0x20};
+    NSCAssert([appleKind([NSData dataWithBytes:beats length:7], &label) isEqual:@"headphones"], @"other pairing = headphones");
+    uint8_t nearby[] = {0x4C, 0x00, 0x10, 0x05, 0x01, 0x18, 0x44, 0x00, 0x00, 0x12, 0x02, 0x00, 0x00};
+    NSCAssert([appleKind([NSData dataWithBytes:nearby length:13], &label) isEqual:@"airtag"], @"must walk past the first message");
+    uint8_t bad[] = {0x4C, 0x00, 0x07, 0x40, 0x01};
+    NSCAssert(!appleKind([NSData dataWithBytes:bad length:5], &label), @"overlong length must not read past the end");
+    NSCAssert(!appleKind([NSData data], &label), @"empty data");
+    NSCAssert([modelKind(@"iPhone15,2", &label) isEqual:@"iphone"], @"iPhone model");
+    NSCAssert([modelKind(@"AudioAccessory5,1", &label) isEqual:@"homepod"], @"HomePod model");
+    NSCAssert([modelKind(@"iMac21,1", &label) isEqual:@"desktopcomputer"], @"iMac is not a laptop");
+    NSCAssert(!modelKind(nil, &label), @"no model");
+    NSCAssert([nameKind(@"JBL Flip 6") isEqual:@"hifispeaker"], @"speaker by brand");
+    NSCAssert([nameKind(@"WH-1000XM5") isEqual:@"headphones"], @"Sony headphones");
+    NSCAssert([nameKind(@"AirPods Max Edwina") isEqual:@"airpodsmax"], @"AirPods Max by name");
+    NSCAssert(!nameKind(@"XYZ-123"), @"unknown name");
 
     NSString *key = CBAdvertisementDataManufacturerDataKey;
     NSCAssert(isApple(@{key: [NSData dataWithBytes:(uint8_t[]){0x4C, 0x00, 0x10} length:3]}), @"Apple id must match");
@@ -563,14 +812,6 @@ static uint64_t uptimeNs(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 
 #pragma mark - Radar
 
-static NSString *deviceSymbol(NSString *name) {
-    for (NSArray<NSString *> *m in @[@[@"Watch", @"applewatch"], @[@"iPad", @"ipad"],
-                                     @[@"AirPods", @"airpods"], @[@"Mac", @"laptopcomputer"],
-                                     @[@"iPhone", @"iphone"]])
-        if ([name containsString:m[0]]) return m[1];
-    return @"questionmark.square.dashed";
-}
-
 @interface RadarTile : NSAccessibilityElement
 @property (nonatomic, copy) void (^press)(void);
 @end
@@ -585,9 +826,9 @@ static NSString *deviceSymbol(NSString *name) {
 // The Mac sits in the middle and each nearby Apple device sits as far out as
 // its signal is weak. The dashed ring is the Distance setting: past it = away.
 @interface RadarView : NSView
-@property (nonatomic, copy) NSArray<NSDictionary *> *devices;  // {id, name, rssi}
-@property (nonatomic, copy) NSString *chosen;
-@property (nonatomic) NSInteger threshold;
+@property (nonatomic, copy) NSArray<NSDictionary *> *devices;  // {id, name, meters, symbol}
+@property (nonatomic, copy) NSSet<NSString *> *watched;
+@property (nonatomic) double limit;  // metres
 @property (nonatomic, copy) void (^onPick)(NSString *uuid, NSString *name);
 @end
 
@@ -609,17 +850,19 @@ static NSString *deviceSymbol(NSString *name) {
     return self;
 }
 
-- (CGFloat)radiusFor:(NSInteger)rssi {
-    CGFloat inner = 48, outer = NSWidth(self.bounds) / 2 - 40;
-    CGFloat t = MIN(MAX((-40.0 - rssi) / 55.0, 0), 1);  // -40 dBm at the Mac, -95 dBm at the edge
-    return inner + (outer - inner) * t;
+// Log scale from 30 cm at the Mac to 10 m at the edge, so 1, 2 and 3 m
+// still get their own rings.
+- (CGFloat)radiusFor:(double)meters {
+    CGFloat inner = 52, outer = NSWidth(self.bounds) / 2 - 40;
+    double t = log(MAX(meters, 0.3) / 0.3) / log(10 / 0.3);
+    return inner + (outer - inner) * MIN(t, 1);
 }
 
 - (void)setDevices:(NSArray<NSDictionary *> *)devices {
     _devices = [devices copy];
     NSMutableDictionary *next = [NSMutableDictionary dictionary];
     for (NSDictionary *d in devices) {
-        CGFloat target = [self radiusFor:[d[@"rssi"] integerValue]];
+        CGFloat target = [self radiusFor:[d[@"meters"] doubleValue]];
         NSNumber *old = _radius[d[@"id"]];
         next[d[@"id"]] = @(old ? old.doubleValue + (target - old.doubleValue) * 0.15 : target);
     }
@@ -635,7 +878,9 @@ static NSString *deviceSymbol(NSString *name) {
 }
 
 - (void)drawSymbol:(NSString *)name size:(CGFloat)size color:(NSColor *)color in:(NSRect)r {
-    NSImage *img = [[NSImage imageWithSystemSymbolName:name accessibilityDescription:nil]
+    NSImage *img = [([NSImage imageWithSystemSymbolName:name accessibilityDescription:nil]
+                         ?: [NSImage imageWithSystemSymbolName:@"questionmark.square.dashed"
+                                     accessibilityDescription:nil])
         imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:size
                                                                                     weight:NSFontWeightMedium]];
     NSImage *tinted = [NSImage imageWithSize:img.size flipped:NO drawingHandler:^BOOL(NSRect b) {
@@ -662,13 +907,23 @@ static NSString *deviceSymbol(NSString *name) {
         return [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(c.x - r, c.y - r, 2 * r, 2 * r)];
     };
 
-    NSBezierPath *edge = ring([self radiusFor:-95] + 24);
+    NSBezierPath *edge = ring([self radiusFor:10] + 24);
     [[NSColor.labelColor colorWithAlphaComponent:0.04] setFill];
     [edge fill];
     [NSColor.separatorColor setStroke];
     [edge stroke];
 
-    NSBezierPath *lockLine = ring([self radiusFor:_threshold]);
+    NSDictionary *scale = @{NSFontAttributeName: [NSFont systemFontOfSize:9],
+                            NSForegroundColorAttributeName: NSColor.tertiaryLabelColor};
+    for (int i = 0; i < 5; i++) {
+        double m = kDistances[i];
+        CGFloat r = [self radiusFor:m];
+        [[NSColor.labelColor colorWithAlphaComponent:0.08] setStroke];
+        [ring(r) stroke];
+        [[NSString stringWithFormat:@"%g m", m] drawAtPoint:NSMakePoint(c.x + 3, c.y + r + 1) withAttributes:scale];
+    }
+
+    NSBezierPath *lockLine = ring([self radiusFor:_limit]);
     CGFloat dash[] = {5, 4};
     [lockLine setLineDash:dash count:2 phase:0];
     lockLine.lineWidth = 1.5;
@@ -686,7 +941,7 @@ static NSString *deviceSymbol(NSString *name) {
 
     NSColor *green = NSColor.systemGreenColor;
     for (NSDictionary *d in [self drawOrder]) {
-        BOOL chosen = [d[@"id"] isEqual:_chosen], hover = [d[@"id"] isEqual:_hover];
+        BOOL chosen = [_watched containsObject:d[@"id"]], hover = [d[@"id"] isEqual:_hover];
         NSRect t = [self tileFor:d];
         NSBezierPath *box = [NSBezierPath bezierPathWithRoundedRect:t xRadius:8 yRadius:8];
         [(chosen ? green : [green colorWithAlphaComponent:hover ? 0.4 : 0.2]) setFill];
@@ -694,15 +949,15 @@ static NSString *deviceSymbol(NSString *name) {
         box.lineWidth = hover ? 2 : 1;
         [green setStroke];
         [box stroke];
-        [self drawSymbol:deviceSymbol(d[@"name"]) size:15 color:chosen ? NSColor.whiteColor : green in:t];
+        [self drawSymbol:d[@"symbol"] size:15 color:chosen ? NSColor.whiteColor : green in:t];
         [self drawText:d[@"name"] color:chosen ? NSColor.labelColor : NSColor.secondaryLabelColor below:t];
     }
 }
 
-// Chosen device last, so it is drawn on top and wins clicks.
+// Watched devices last, so they are drawn on top and win clicks.
 - (NSArray<NSDictionary *> *)drawOrder {
     return [_devices sortedArrayUsingComparator:^(NSDictionary *a, NSDictionary *b) {
-        return [@([a[@"id"] isEqual:self.chosen]) compare:@([b[@"id"] isEqual:self.chosen])];
+        return [@([self.watched containsObject:a[@"id"]]) compare:@([self.watched containsObject:b[@"id"]])];
     }];
 }
 
@@ -740,8 +995,9 @@ static NSString *deviceSymbol(NSString *name) {
     for (NSDictionary *d in _devices) {
         RadarTile *t = [RadarTile new];
         t.accessibilityRole = NSAccessibilityButtonRole;
-        t.accessibilityLabel = [NSString stringWithFormat:@"%@, %@ dBm%@", d[@"name"], d[@"rssi"],
-                                                          [d[@"id"] isEqual:_chosen] ? @", watched" : @""];
+        t.accessibilityLabel = [NSString stringWithFormat:@"%@, about %.1f metres%@", d[@"name"],
+                                                          [d[@"meters"] doubleValue],
+                                                          [_watched containsObject:d[@"id"]] ? @", watched" : @""];
         t.accessibilityParent = self;
         t.accessibilityFrameInParentSpace = [self tileFor:d];
         __weak RadarView *weakSelf = self;
@@ -764,22 +1020,42 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
 }
 
 @interface Delegate : NSObject <NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate,
-                                CBCentralManagerDelegate>
+                                CBCentralManagerDelegate, CBPeripheralDelegate,
+                                CMHeadphoneMotionManagerDelegate>
+- (void)setPeek:(BOOL)on;
 @end
 
 @implementation Delegate {
     NSStatusItem *_item;
     NSMenuItem *_login, *_awayItem;
-    NSMenu *_blurMenu, *_dimMenu, *_tintMenu;
+    NSMenu *_blurMenu, *_dimMenu, *_tintMenu, *_lookMenu;
     CBCentralManager *_bt;
-    NSMutableDictionary<NSUUID *, NSDictionary *> *_seen;  // id -> {name, rssi, at}
+    NSMutableDictionary<NSUUID *, NSDictionary *> *_seen;  // id -> {name, rssi, at, symbol}
+    NSMutableDictionary<NSUUID *, CBPeripheral *> *_peripherals;  // Apple devices we may probe
+    NSMutableDictionary<NSUUID *, NSString *> *_models;  // GATT model number, "" if probing failed
+    CBPeripheral *_probing;
     NSTimer *_awayTimer, *_radarTimer;
     NSWindow *_awayWindow;
     RadarView *_radar;
     NSTextField *_awayLabel;
     NSSegmentedControl *_distance;
-    NSButton *_awayOff;
+    NSButton *_awayOff, *_calibrate;
+    NSMutableArray<NSNumber *> *_calibration;
+    NSTimeInterval _calibrateUntil;
     id<NSObject> _noNap;
+    id _head;  // CMHeadphoneMotionManager, macOS 14+
+    BOOL _headConnected;
+    Head _headState;
+    NSArray<NSWindow *> *_peekWindows;
+    id _peekMonitor;
+    BOOL _peekOn;
+    NSUInteger _peekGen;  // bumps on every on/off, so stale callbacks can tell
+    int _peekSide;        // side the blur starts from
+    NSArray<NSArray<CALayer *> *> *_peekMasks;  // per screen: blur level masks, then the dim mask
+    NSTimer *_peekTimer;
+    double _peekProgress;
+    NSTimeInterval _peekLast;
+    NSMenuItem *_lookStatus;
     Away _away;
 }
 
@@ -790,6 +1066,8 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
 - (void)startBluetooth {
     if (_bt) return;
     _seen = [NSMutableDictionary dictionary];
+    _peripherals = [NSMutableDictionary dictionary];
+    _models = [NSMutableDictionary dictionary];
     _bt = [[CBCentralManager alloc] initWithDelegate:self queue:nil];
     _awayTimer = [NSTimer scheduledTimerWithTimeInterval:2
                                                   target:self
@@ -813,36 +1091,112 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
         advertisementData:(NSDictionary<NSString *, id> *)ad
                      RSSI:(NSNumber *)rssi {
     NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
-    BOOL chosen = [p.identifier.UUIDString isEqualToString:
-                                           [NSUserDefaults.standardUserDefaults stringForKey:@"awayID"]];
+    NSUUID *k = p.identifier;
+    BOOL chosen = awayDevices()[k.UUIDString] != nil, apple = isApple(ad);
     if (chosen) awaySeen(&_away, rssi.integerValue, awayRSSI(), now);
-    if (!chosen && !isApple(ad)) return;  // headphones, TVs, the neighbours' kettle
+    if (chosen && _calibration && rssi.integerValue < 0) [_calibration addObject:rssi];
 
-    NSString *name = p.name ?: ad[CBAdvertisementDataLocalNameKey] ?: _seen[p.identifier][@"name"];
-    _seen[p.identifier] = @{@"name": name ?: @"", @"rssi": rssi, @"at": @(now)};
+    NSDictionary *old = _seen[k];
+    NSString *name = p.name ?: ad[CBAdvertisementDataLocalNameKey];
+    // Unnamed non-Apple gadgets are mostly noise; skip them.
+    if (!chosen && !apple && !name && !old) return;
+
+    NSString *label = nil;
+    NSString *symbol = (apple ? appleKind(ad[CBAdvertisementDataManufacturerDataKey], &label) : nil)
+                           ?: modelKind(_models[k], &label)
+                           ?: nameKind(name ?: old[@"name"])
+                           ?: serviceKind(ad[CBAdvertisementDataServiceUUIDsKey])
+                           ?: old[@"symbol"];
+    if (apple && !symbol && !_models[k]) _peripherals[k] = p;  // worth asking for its model
+
+    _seen[k] = @{@"name": name ?: old[@"name"] ?: label ?: @"",
+                 @"rssi": rssi,
+                 @"at": @(now),
+                 @"symbol": symbol ?: @"questionmark.square.dashed"};
+}
+
+#pragma mark Device identification
+
+// Ask one unidentified Apple device at a time for its model number (Device
+// Information service). Only while the radar is open, and only nearby ones.
+- (void)identifyNext {
+    if (_probing || !_radarTimer || _bt.state != CBManagerStatePoweredOn) return;
+    for (NSUUID *k in _peripherals) {
+        if (_models[k] || [_seen[k][@"rssi"] integerValue] < -80) continue;
+        CBPeripheral *p = _probing = _peripherals[k];
+        _models[k] = @"";  // one attempt per device
+        p.delegate = self;
+        [_bt connectPeripheral:p options:nil];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            if (self->_probing == p) [self finishProbe];
+        });
+        return;
+    }
+}
+
+- (void)finishProbe {
+    [_peripherals removeObjectForKey:_probing.identifier];
+    [_bt cancelPeripheralConnection:_probing];
+    _probing = nil;
+}
+
+- (void)centralManager:(CBCentralManager *)c didConnectPeripheral:(CBPeripheral *)p {
+    [p discoverServices:@[[CBUUID UUIDWithString:@"180A"]]];
+}
+
+- (void)centralManager:(CBCentralManager *)c didFailToConnectPeripheral:(CBPeripheral *)p error:(NSError *)e {
+    if (p == _probing) [self finishProbe];
+}
+
+- (void)peripheral:(CBPeripheral *)p didDiscoverServices:(NSError *)e {
+    CBService *info = p.services.firstObject;
+    if (info) [p discoverCharacteristics:@[[CBUUID UUIDWithString:@"2A24"]] forService:info];
+    else if (p == _probing) [self finishProbe];
+}
+
+- (void)peripheral:(CBPeripheral *)p didDiscoverCharacteristicsForService:(CBService *)s error:(NSError *)e {
+    CBCharacteristic *model = s.characteristics.firstObject;
+    if (model) [p readValueForCharacteristic:model];
+    else if (p == _probing) [self finishProbe];
+}
+
+- (void)peripheral:(CBPeripheral *)p didUpdateValueForCharacteristic:(CBCharacteristic *)ch error:(NSError *)e {
+    NSString *model = ch.value ? [[NSString alloc] initWithData:ch.value encoding:NSUTF8StringEncoding] : nil;
+    if (model.length) _models[p.identifier] = model;
+    if (p == _probing) [self finishProbe];
 }
 
 - (void)awayTick:(NSTimer *)t {
     NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
     // Random BLE addresses keep minting new ids; forget anything stale.
     for (NSUUID *k in _seen.allKeys)
-        if (now - [_seen[k][@"at"] doubleValue] > 30) [_seen removeObjectForKey:k];
+        if (now - [_seen[k][@"at"] doubleValue] > 30) {
+            [_seen removeObjectForKey:k];
+            [_models removeObjectForKey:k];
+            if (_peripherals[k] != _probing) [_peripherals removeObjectForKey:k];
+        }
 
     if (awayDue(&_away, now)) [LockController.shared lock];
 }
 
 - (NSString *)awayStatus {
-    NSString *chosen = [NSUserDefaults.standardUserDefaults stringForKey:@"awayID"];
-    NSDictionary *s = _seen[[[NSUUID alloc] initWithUUIDString:chosen]];
     NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
-    BOOL fresh = s && now - [s[@"at"] doubleValue] < 5;
-    NSInteger rssi = [s[@"rssi"] integerValue];
+    NSInteger rssi = NSIntegerMin;  // strongest recent reading among watched devices
+    for (NSString *uuid in awayDevices()) {
+        NSDictionary *s = _seen[[[NSUUID alloc] initWithUUIDString:uuid]];
+        NSInteger r = [s[@"rssi"] integerValue];
+        if (s && now - [s[@"at"] doubleValue] < 5 && r < 0) rssi = MAX(rssi, r);
+    }
+    BOOL fresh = rssi != NSIntegerMin;
 
-    if (fresh && rssi >= awayRSSI()) return [NSString stringWithFormat:@"Near · %ld dBm", rssi];
+    if (_calibrateUntil) return [NSString stringWithFormat:@"Calibrating — stay where you normally sit… %.0f s",
+                                                          MAX(0, _calibrateUntil - now)];
+    double m = metersFor(rssi, awayRef());
+    if (fresh && rssi >= awayRSSI()) return [NSString stringWithFormat:@"Near · ~%.1f m", m];
     if (_away.armed)
         return [NSString stringWithFormat:@"Moving away · locks in %.0f s",
                                           MAX(0, kAwayDelay - (now - _away.nearAt))];
-    return fresh ? [NSString stringWithFormat:@"Too far to arm · %ld dBm", rssi] : @"Not in range";
+    return fresh ? [NSString stringWithFormat:@"Too far to arm · ~%.1f m", m] : @"Not in range";
 }
 
 - (void)showAwayWindow:(id)sender {
@@ -850,13 +1204,13 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
     if (!_awayWindow) {
         _radar = [[RadarView alloc] initWithFrame:NSZeroRect];
         __weak Delegate *weakSelf = self;
-        _radar.onPick = ^(NSString *uuid, NSString *name) { [weakSelf chooseAway:uuid name:name]; };
+        _radar.onPick = ^(NSString *uuid, NSString *name) { [weakSelf toggleAway:uuid name:name]; };
 
         _awayLabel = [NSTextField wrappingLabelWithString:@""];
         _awayLabel.alignment = NSTextAlignmentCenter;
-        _awayLabel.preferredMaxLayoutWidth = 340;
+        _awayLabel.preferredMaxLayoutWidth = 400;
 
-        _distance = [NSSegmentedControl segmentedControlWithLabels:@[@"Close", @"Medium", @"Far"]
+        _distance = [NSSegmentedControl segmentedControlWithLabels:@[@"1 m", @"2 m", @"3 m", @"5 m", @"8 m"]
                                                       trackingMode:NSSegmentSwitchTrackingSelectOne
                                                             target:self
                                                             action:@selector(setDistance:)];
@@ -864,14 +1218,18 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
             [NSStackView stackViewWithViews:@[[NSTextField labelWithString:@"Lock beyond"], _distance]];
 
         _awayOff = [NSButton buttonWithTitle:@"Turn Off" target:self action:@selector(turnAwayOff:)];
+        _calibrate = [NSButton buttonWithTitle:@"Calibrate" target:self action:@selector(calibrate:)];
+        _calibrate.toolTip = @"Sit as you normally do, with your devices where you usually keep them "
+                             @"(pocket included), then click. Distances are measured from there.";
+        NSStackView *buttons = [NSStackView stackViewWithViews:@[_calibrate, _awayOff]];
 
-        NSStackView *stack = [NSStackView stackViewWithViews:@[_radar, _awayLabel, distanceRow, _awayOff]];
+        NSStackView *stack = [NSStackView stackViewWithViews:@[_radar, _awayLabel, distanceRow, buttons]];
         stack.orientation = NSUserInterfaceLayoutOrientationVertical;
         stack.spacing = 14;
         stack.edgeInsets = NSEdgeInsetsMake(20, 20, 20, 20);
         [NSLayoutConstraint activateConstraints:@[
-            [_radar.widthAnchor constraintEqualToConstant:340],
-            [_radar.heightAnchor constraintEqualToConstant:340],
+            [_radar.widthAnchor constraintEqualToConstant:400],
+            [_radar.heightAnchor constraintEqualToConstant:400],
         ]];
 
         _awayWindow = [[NSWindow alloc] initWithContentRect:NSZeroRect
@@ -905,54 +1263,341 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
 }
 
 - (void)refreshAway:(NSTimer *)t {
-    NSString *chosen = [NSUserDefaults.standardUserDefaults stringForKey:@"awayID"];
+    NSDictionary<NSString *, NSString *> *watched = awayDevices();
 
     NSMutableArray<NSUUID *> *ids = [[_seen keysSortedByValueUsingComparator:^(NSDictionary *a, NSDictionary *b) {
         return [b[@"rssi"] compare:a[@"rssi"]];
     }] mutableCopy];
-    NSUUID *chosenID = chosen ? [[NSUUID alloc] initWithUUIDString:chosen] : nil;
-    if (ids.count > 10) {
-        [ids removeObjectsInRange:NSMakeRange(10, ids.count - 10)];
-        if (_seen[chosenID] && ![ids containsObject:chosenID]) [ids addObject:chosenID];
+    if (ids.count > 10) [ids removeObjectsInRange:NSMakeRange(10, ids.count - 10)];
+    for (NSString *uuid in watched) {
+        NSUUID *k = [[NSUUID alloc] initWithUUIDString:uuid];
+        if (_seen[k] && ![ids containsObject:k]) [ids addObject:k];
     }
 
     NSMutableArray *devices = [NSMutableArray array];
     for (NSUUID *k in ids) {
         NSString *name = _seen[k][@"name"];
-        if (!name.length) name = [@"Apple device " stringByAppendingString:[k.UUIDString substringToIndex:4]];
-        [devices addObject:@{@"id": k.UUIDString, @"name": name, @"rssi": _seen[k][@"rssi"]}];
+        if (!name.length) name = [@"Device " stringByAppendingString:[k.UUIDString substringToIndex:4]];
+        [devices addObject:@{@"id": k.UUIDString, @"name": name,
+                             @"meters": @(metersFor([_seen[k][@"rssi"] integerValue], awayRef())),
+                             @"symbol": _seen[k][@"symbol"]}];
     }
-    _radar.chosen = chosen;
-    _radar.threshold = awayRSSI();
+    [self identifyNext];
+    _radar.watched = [NSSet setWithArray:watched.allKeys];
+    _radar.limit = awayMeters();
     _radar.devices = devices;
 
     _awayLabel.stringValue =
         _bt.state == CBManagerStateUnauthorized
             ? @"Bluetooth access is off for pinlock. Allow it in System Settings › Privacy & Security › Bluetooth."
         : _bt.state != CBManagerStatePoweredOn ? @"Waiting for Bluetooth…"
-        : !chosen ? @"Hold your iPhone next to the Mac and click it on the radar."
-                  : [NSString stringWithFormat:@"%@ — %@",
-                                               [NSUserDefaults.standardUserDefaults stringForKey:@"awayName"],
-                                               [self awayStatus]];
+        : !watched.count
+            ? @"Click the devices you carry on the radar. Any one of them nearby counts as you being here."
+            : [NSString stringWithFormat:@"%@ — %@",
+                                         [[watched.allValues sortedArrayUsingSelector:@selector(compare:)]
+                                             componentsJoinedByString:@", "],
+                                         [self awayStatus]];
 
     _distance.selectedSegment = -1;
-    for (NSInteger i = 0; i < 3; i++)
-        if (kDistances[i] == awayRSSI()) _distance.selectedSegment = i;
-    _awayOff.enabled = chosen != nil;
+    for (NSInteger i = 0; i < 5; i++)
+        if (kDistances[i] == awayMeters()) _distance.selectedSegment = i;
+    _awayOff.enabled = _calibrate.enabled = watched.count > 0 && !_calibrateUntil;
+    if (_calibrateUntil && NSProcessInfo.processInfo.systemUptime >= _calibrateUntil) [self finishCalibration];
 }
 
-- (void)chooseAway:(NSString *)uuid name:(NSString *)name {
-    // nil (Turn Off) removes both keys.
-    [NSUserDefaults.standardUserDefaults setObject:uuid forKey:@"awayID"];
-    [NSUserDefaults.standardUserDefaults setObject:name forKey:@"awayName"];
+- (void)saveAwayDevices:(NSDictionary *)devices {
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    [d setObject:devices forKey:@"awayDevices"];
+    [d removeObjectForKey:@"awayID"];
+    [d removeObjectForKey:@"awayName"];
     _away = (Away){0};
     [self refreshAway:nil];
 }
 
-- (void)turnAwayOff:(id)sender { [self chooseAway:nil name:nil]; }
+- (void)toggleAway:(NSString *)uuid name:(NSString *)name {
+    NSMutableDictionary *devices = [awayDevices() mutableCopy];
+    devices[uuid] = devices[uuid] ? nil : name;
+    [self saveAwayDevices:devices];
+}
+
+- (void)turnAwayOff:(id)sender { [self saveAwayDevices:@{}]; }
 
 - (void)setDistance:(NSSegmentedControl *)sender {
-    [NSUserDefaults.standardUserDefaults setInteger:kDistances[sender.selectedSegment] forKey:@"awayRSSI"];
+    [NSUserDefaults.standardUserDefaults setDouble:kDistances[sender.selectedSegment] forKey:@"awayMeters"];
+}
+
+// Record ~5 s of readings from where you sit and call their median "here".
+- (void)calibrate:(id)sender {
+    _calibration = [NSMutableArray array];
+    _calibrateUntil = NSProcessInfo.processInfo.systemUptime + 5;
+}
+
+- (void)finishCalibration {
+    _calibrateUntil = 0;
+    NSArray<NSNumber *> *r = [_calibration sortedArrayUsingSelector:@selector(compare:)];
+    _calibration = nil;
+    if (r.count < 5) {
+        _awayLabel.stringValue = @"Calibration failed: no signal from your devices. Try again.";
+        return;
+    }
+    [NSUserDefaults.standardUserDefaults setInteger:r[r.count / 2].integerValue forKey:@"awayRef"];
+    _away = (Away){0};
+}
+
+#pragma mark Blur When Looking Away
+
+- (NSString *)headStatus {
+    if (@available(macOS 14.0, *)) {
+        CMAuthorizationStatus a = CMHeadphoneMotionManager.authorizationStatus;
+        if (a == CMAuthorizationStatusDenied || a == CMAuthorizationStatusRestricted)
+            return @"Motion access is off: allow pinlock in System Settings › Privacy & Security";
+        if (!lookAwayAngle()) return @"Needs AirPods or Beats with head tracking";
+        if (!_headConnected) return @"Waiting for head-tracking headphones…";
+        if (!CGPreflightScreenCaptureAccess())
+            return @"Allow Screen Recording in System Settings for the full blur";
+        return @"Headphones connected";
+    }
+    return @"Needs macOS 14 or later";
+}
+
+- (void)setLookAway:(NSMenuItem *)sender {
+    [NSUserDefaults.standardUserDefaults setInteger:sender.tag forKey:@"lookAway"];
+    // The strong blur works from a screen snapshot; ask once, up front.
+    if (sender.tag && !CGPreflightScreenCaptureAccess()) CGRequestScreenCaptureAccess();
+    [self updateHeadTracking];
+}
+
+- (void)updateHeadTracking {
+    if (@available(macOS 14.0, *)) {
+        if (lookAwayAngle() && !_head) {
+            CMHeadphoneMotionManager *m = _head = [CMHeadphoneMotionManager new];
+            m.delegate = self;
+            __weak Delegate *weakSelf = self;
+            [m startDeviceMotionUpdatesToQueue:NSOperationQueue.mainQueue
+                                   withHandler:^(CMDeviceMotion *motion, NSError *err) {
+                if (motion) [weakSelf headMoved:motion.attitude.yaw];
+            }];
+        } else if (!lookAwayAngle() && _head) {
+            [(CMHeadphoneMotionManager *)_head stopDeviceMotionUpdates];
+            _head = nil;
+            [self headGone];
+        }
+    }
+}
+
+- (void)headMoved:(double)yaw {
+    _headConnected = YES;
+    [self setPeek:headSample(&_headState, yaw, lookAwayAngle() * M_PI / 180,
+                             NSProcessInfo.processInfo.systemUptime)];
+}
+
+- (void)headphoneMotionManagerDidConnect:(CMHeadphoneMotionManager *)m {
+    _headConnected = YES;
+}
+
+- (void)headphoneMotionManagerDidDisconnect:(CMHeadphoneMotionManager *)m {
+    [self headGone];
+}
+
+// Headphones off or gone: never leave the screen blurred, and take a fresh
+// baseline when they come back.
+- (void)headGone {
+    _headConnected = NO;
+    _headState = (Head){0};
+    [self setPeek:NO];
+}
+
+// A privacy cover, not a lock: it lets all input through and lifts as soon as
+// you face the screen again. The blur copies the iPhone Duo's: sharp on one
+// side, getting blurrier and darker towards the other (σ ~ d³), starting at the
+// side you turned to and spreading until the whole screen is evenly blurred;
+// looking back runs it in reverse. It works from a snapshot of the screen
+// (Screen Recording); without one the screen only darkens the same way.
+- (void)setPeek:(BOOL)on {
+    if (on == _peekOn) return;
+    _peekOn = on;
+    NSUInteger gen = ++_peekGen;
+
+    if (on) {
+        // Clicking or scrolling means you are looking at the screen, so that
+        // direction becomes the new "facing". Fixes a bad start baseline.
+        _peekMonitor = [NSEvent
+            addGlobalMonitorForEventsMatchingMask:NSEventMaskLeftMouseDown |
+                                                  NSEventMaskRightMouseDown |
+                                                  NSEventMaskScrollWheel
+                                          handler:^(NSEvent *e) {
+            headRecentre(&self->_headState);
+            [self setPeek:NO];
+        }];
+        if (_peekWindows) {  // still clearing: just turn it around
+            [self startPeekTimer];
+            return;
+        }
+        _peekSide = _headState.side ?: 1;
+        void (^show)(NSDictionary *) = ^(NSDictionary *shots) {
+            if (gen != self->_peekGen) return;  // looked back before the snapshot arrived
+            [self buildPeek:shots];
+            [self startPeekTimer];
+        };
+        if (@available(macOS 14.0, *)) {
+            if (CGPreflightScreenCaptureAccess()) {
+                [self snapshotScreens:show];
+                return;
+            }
+        }
+        NSLog(@"pinlock: no Screen Recording access, darkening instead of blurring");
+        show(@{});
+    } else {
+        [NSEvent removeMonitor:_peekMonitor];
+        _peekMonitor = nil;
+        if (_peekWindows) [self startPeekTimer];
+    }
+}
+
+// displayID -> @[blur level 1, …], baked once here. There is no sharp copy:
+// where the blur hasn't reached yet the live screen shows through, so the
+// cover can't jump when it appears. Half size, since it only gets blurred.
+- (void)snapshotScreens:(void (^)(NSDictionary *))done API_AVAILABLE(macos(14.0)) {
+    NSMutableDictionary<NSNumber *, NSNumber *> *scales = [NSMutableDictionary dictionary];
+    for (NSScreen *scr in NSScreen.screens)
+        scales[scr.deviceDescription[@"NSScreenNumber"]] = @(scr.backingScaleFactor);
+
+    [SCShareableContent getShareableContentWithCompletionHandler:^(SCShareableContent *content, NSError *err) {
+        if (err) NSLog(@"pinlock: can't list displays to snapshot: %@", err);
+        NSMutableDictionary *shots = [NSMutableDictionary dictionary];
+        CIContext *ci = [CIContext context];
+        dispatch_group_t group = dispatch_group_create();
+        for (SCDisplay *d in content.displays) {
+            CGFloat scale = scales[@(d.displayID)].doubleValue ?: 2;
+            SCStreamConfiguration *cfg = [SCStreamConfiguration new];
+            cfg.width = d.width * scale / 2;
+            cfg.height = d.height * scale / 2;
+            cfg.showsCursor = NO;
+            dispatch_group_enter(group);
+            [SCScreenshotManager
+                captureImageWithFilter:[[SCContentFilter alloc] initWithDisplay:d excludingWindows:@[]]
+                         configuration:cfg
+                     completionHandler:^(CGImageRef img, NSError *e) {
+                if (e) NSLog(@"pinlock: snapshot of display %u failed: %@", d.displayID, e);
+                if (img) {
+                    NSMutableArray *levels = [NSMutableArray array];
+                    CIImage *half = [CIImage imageWithCGImage:img];
+                    for (int k = 0; k < kBlurLevels; k++) {
+                        CIImage *soft = [[half.imageByClampingToExtent
+                            imageByApplyingGaussianBlurWithSigma:kBlurSigma[k] * scale / 2]
+                            imageByCroppingToRect:half.extent];
+                        [levels addObject:CFBridgingRelease([ci createCGImage:soft fromRect:half.extent])];
+                    }
+                    @synchronized (shots) { shots[@(d.displayID)] = levels; }
+                }
+                dispatch_group_leave(group);
+            }];
+        }
+        dispatch_group_notify(group, dispatch_get_main_queue(), ^{
+            NSLog(@"pinlock: snapshot %lu of %lu displays", shots.count, content.displays.count);
+            done(shots);
+        });
+    }];
+}
+
+- (void)buildPeek:(NSDictionary *)shots {
+    NSMutableArray<NSWindow *> *ws = [NSMutableArray array];
+    NSMutableArray<NSArray<CALayer *> *> *masks = [NSMutableArray array];
+    for (NSScreen *scr in NSScreen.screens) {
+        NSWindow *w = [[NSWindow alloc] initWithContentRect:scr.frame
+                                                  styleMask:NSWindowStyleMaskBorderless
+                                                    backing:NSBackingStoreBuffered
+                                                      defer:NO];
+        w.level = CGShieldingWindowLevel() - 1;  // under the lock shield
+        w.opaque = NO;
+        w.hasShadow = NO;
+        w.releasedWhenClosed = NO;
+        w.ignoresMouseEvents = YES;
+        w.backgroundColor = NSColor.clearColor;
+        w.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
+                               NSWindowCollectionBehaviorStationary |
+                               NSWindowCollectionBehaviorFullScreenAuxiliary |
+                               NSWindowCollectionBehaviorIgnoresCycle;
+        NSView *root = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, scr.frame.size.width, scr.frame.size.height)];
+        root.wantsLayer = YES;
+        w.contentView = root;
+
+        // Blur levels weakest first, each showing only where the blur has
+        // reached it (the live screen shows through below), then the darkening.
+        NSArray *levels = shots[scr.deviceDescription[@"NSScreenNumber"]];
+        NSMutableArray<CALayer *> *screenMasks = [NSMutableArray array];
+        for (NSUInteger k = 0; k <= levels.count; k++) {
+            CALayer *l = [CALayer layer];
+            l.frame = root.bounds;
+            if (k < levels.count) l.contents = levels[k];
+            else l.backgroundColor = NSColor.blackColor.CGColor;  // the dim layer
+            CALayer *mask = [CALayer layer];
+            mask.frame = l.bounds;
+            mask.contentsGravity = kCAGravityResize;
+            mask.contents = CFBridgingRelease(maskStrip((uint8_t[1]){0}, 1));  // hidden until the first frame
+            l.mask = mask;
+            [screenMasks addObject:mask];
+            [root.layer addSublayer:l];
+        }
+        [masks addObject:screenMasks];
+        [w orderFrontRegardless];
+        [ws addObject:w];
+    }
+    _peekWindows = ws;
+    _peekMasks = masks;
+    _peekProgress = 0;
+    [self renderPeek];
+}
+
+- (void)startPeekTimer {
+    if (_peekTimer) return;
+    _peekLast = NSProcessInfo.processInfo.systemUptime;
+    _peekTimer = [NSTimer timerWithTimeInterval:1.0 / 60 target:self selector:@selector(peekStep:)
+                                       userInfo:nil repeats:YES];
+    [NSRunLoop.mainRunLoop addTimer:_peekTimer forMode:NSRunLoopCommonModes];
+}
+
+// One clock for both directions, so looking back mid-way reverses smoothly.
+- (void)peekStep:(NSTimer *)t {
+    NSTimeInterval now = NSProcessInfo.processInfo.systemUptime, dt = now - _peekLast;
+    _peekLast = now;
+    _peekProgress = _peekOn ? MIN(1, _peekProgress + dt / kPeekIn) : MAX(0, _peekProgress - dt / kPeekOut);
+    [self renderPeek];
+
+    if (_peekProgress == (_peekOn ? 1 : 0)) {
+        [_peekTimer invalidate];
+        _peekTimer = nil;
+        if (!_peekOn) {
+            for (NSWindow *w in _peekWindows) [w close];
+            _peekWindows = nil;
+            _peekMasks = nil;
+        }
+    }
+}
+
+// Each mask is a thin strip across the screen, stretched to full height:
+// layer k shows where the blur at that x has reached its level, the last
+// one is the darkening.
+- (void)renderPeek {
+    double e = _peekProgress * _peekProgress * (3 - 2 * _peekProgress);  // smoothstep
+    enum { n = 128 };
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    for (NSArray<CALayer *> *screenMasks in _peekMasks) {
+        NSUInteger count = screenMasks.count;
+        BOOL dimOnly = count == 1;
+        for (NSUInteger k = 0; k < count; k++) {
+            BOOL dim = k == count - 1;
+            uint8_t alpha[n];
+            for (int i = 0; i < n; i++) {
+                double x = (i + 0.5) / n, d = _peekSide > 0 ? x : 1 - x;  // d: 0 at the sharp side
+                double b = duoBlur(e, d);
+                alpha[i] = (uint8_t)lround(255 * (dim ? (dimOnly ? 0.85 : kPeekDim) * b : blurLevelAlpha(b, (int)k)));
+            }
+            screenMasks[k].contents = CFBridgingRelease(maskStrip(alpha, n));
+        }
+    }
+    [CATransaction commit];
 }
 
 - (NSMenu *)levelMenu:(NSArray<NSString *> *)titles
@@ -1011,6 +1656,14 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
                          keyEquivalent:@""];
     _awayItem.target = self;
 
+    _lookMenu = [self levelMenu:@[@"Off", @"Small turn (30°)", @"Medium turn (45°)", @"Large turn (60°)"]
+                           tags:@[@0, @30, @45, @60]
+                         action:@selector(setLookAway:)];
+    _lookStatus = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
+    [_lookMenu insertItem:_lookStatus atIndex:0];
+    [_lookMenu insertItem:NSMenuItem.separatorItem atIndex:1];
+    [menu addItemWithTitle:@"Blur When Looking Away" action:nil keyEquivalent:@""].submenu = _lookMenu;
+
     [menu addItem:NSMenuItem.separatorItem];
     [menu addItemWithTitle:@"Quit pinlock" action:@selector(quit:) keyEquivalent:@"q"].target = self;
     _item.menu = menu;
@@ -1028,7 +1681,8 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
         return e;
     }];
 
-    if ([NSUserDefaults.standardUserDefaults stringForKey:@"awayID"]) [self startBluetooth];
+    if (awayDevices().count) [self startBluetooth];
+    [self updateHeadTracking];
 
     if (!currentPIN())
         promptForPIN(@"Set a PIN",
@@ -1036,6 +1690,13 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
 }
 
 - (void)menuWillOpen:(NSMenu *)menu {
+    if (menu == _lookMenu) {
+        _lookStatus.title = [self headStatus];
+        for (NSMenuItem *it in menu.itemArray)
+            if (it.action) it.state = it.tag == lookAwayAngle() ? NSControlStateValueOn : NSControlStateValueOff;
+        return;
+    }
+
     if (menu == _blurMenu || menu == _dimMenu) {
         NSInteger cur = lround((menu == _blurMenu ? blurStrength() : dimStrength()) * 100);
         for (NSMenuItem *it in menu.itemArray)
@@ -1050,9 +1711,7 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
         return;
     }
 
-    _awayItem.state = [NSUserDefaults.standardUserDefaults stringForKey:@"awayID"]
-                          ? NSControlStateValueOn
-                          : NSControlStateValueOff;
+    _awayItem.state = awayDevices().count ? NSControlStateValueOn : NSControlStateValueOff;
 
     if (@available(macOS 13.0, *))
         _login.state = SMAppService.mainAppService.status == SMAppServiceStatusEnabled
@@ -1130,7 +1789,32 @@ int main(int argc, const char *argv[]) {
         del = [Delegate new];
         NSApp.delegate = del;
 
-        if (argc > 1 && strcmp(argv[1], "--hangtest") == 0) {
+        if (argc > 1 && strcmp(argv[1], "--peektest") == 0) {
+            // Blur the screen for 2.5 s without headphones, then quit.
+            // The blur needs Screen Recording; ask for it if missing.
+            if (!CGPreflightScreenCaptureAccess()) {
+                CGRequestScreenCaptureAccess();
+                NSAlert *a = [NSAlert new];
+                a.messageText = @"pinlock can't see the screen";
+                a.informativeText = @"Without Screen Recording access the blur can't run and you only get the "
+                                    @"darkening fallback. Every rebuild counts as a new app to macOS, so "
+                                    @"remove pinlock from the list, add this copy again, and relaunch.";
+                [a addButtonWithTitle:@"Open Settings"];
+                [a addButtonWithTitle:@"Show Fallback"];
+                [NSApp activateIgnoringOtherApps:YES];
+                if ([a runModal] == NSAlertFirstButtonReturn) {
+                    [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:
+                        @"x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"]];
+                    return 0;
+                }
+            }
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 2),
+                           dispatch_get_main_queue(), ^{ [del setPeek:YES]; });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
+                           dispatch_get_main_queue(), ^{ [del setPeek:NO]; });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC),
+                           dispatch_get_main_queue(), ^{ [NSApp terminate:nil]; });
+        } else if (argc > 1 && strcmp(argv[1], "--hangtest") == 0) {
             // Lock, then freeze the main thread: the watchdog must exit the
             // process within kStallLimit. If it doesn't, unlock after 30 s.
             dispatch_async(dispatch_get_main_queue(), ^{ [LockController.shared lock]; });

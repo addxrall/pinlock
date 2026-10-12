@@ -18,9 +18,23 @@ It exists so you don't have to fully lock the Mac every time you step away for a
 
 ```sh
 make            # builds pinlock.app
-make install    # copies it to /Applications and launches it
+make install    # signs it, copies it to /Applications and launches it
 make uninstall
 ```
+
+The first `make install` creates a self-signed code-signing certificate called **pinlock dev** in your login keychain. macOS may ask once whether `codesign` can use it: enter your password and choose **Always Allow**. The certificate gives pinlock the same identity on every build. Without it, each rebuild looks like a new app to macOS and silently loses the permissions below. To get rid of it later, delete **pinlock dev** in Keychain Access.
+
+### Permissions
+
+pinlock only asks for these when you turn on the feature that needs them:
+
+| Permission | Needed for | Asked when |
+| --- | --- | --- |
+| Bluetooth | Lock When Away | you open Lock When Away… |
+| Motion & Fitness | Blur When Looking Away (head tracking) | you pick a turn angle |
+| Screen Recording | the blur of Blur When Looking Away | you pick a turn angle. Relaunch pinlock after allowing it |
+
+If a feature acts as if a permission is missing even though System Settings shows it on, remove pinlock from that list in **System Settings → Privacy & Security**, then relaunch pinlock and allow it again.
 
 ## Usage
 
@@ -28,7 +42,9 @@ make uninstall
 - Lock with **⌃⌥⌘L** or **Lock Now** in the menu.
 - Blur, cover strength and cover colour are configurable from the menu.
 - Forgot the PIN? Click **Use Mac Password** on the lock screen and enter your macOS account password.
-- **Lock When Away…** opens a radar: your Mac in the middle and nearby Apple devices placed by Bluetooth signal strength. Click your iPhone (or Apple Watch) to watch it. The dashed ring is the chosen distance, and pinlock locks once the device stays outside it for 15 seconds. It locks once per absence; unlocking still needs the PIN or password.
+- **Lock When Away…** opens a radar: your Mac in the middle and nearby Bluetooth devices placed by estimated distance, each with an icon for what it is (iPhone, Watch, AirPods, speaker, …). Click the devices you carry to watch them. Any one of them nearby counts as you being there. Pick a distance (1–8 m, the dashed ring), and pinlock locks once every watched device has stayed beyond it for 15 seconds.
+- Distances come from signal strength, which a pocket or your body weakens a lot. Click **Calibrate** while sitting as usual, with your phone wherever you keep it, and distances are measured from there. Treat them as rough: Bluetooth can't measure real distance, so expect about ±1–2 m.
+- **Blur When Looking Away** (macOS 14+): with head-tracking AirPods or Beats on (AirPods Pro, Max, AirPods 3rd gen and later), turning your head away from the screen blurs it the way the iPhone Duo does when it folds: the blur starts at the side you turned to, sharp on the far side and stronger towards your side, then spreads until the whole screen is evenly blurred and slightly darkened. Looking back clears it the same way. The blur needs Screen Recording access (pinlock asks when you turn the feature on). Without it the screen only darkens. The snapshot it blurs stays in memory and is dropped as soon as you look back.
 
 ## If you're locked out
 
@@ -51,6 +67,12 @@ Check the watchdog — this locks, freezes, and should disappear after about 12 
 
 ```sh
 ./pinlock.app/Contents/MacOS/pinlock --hangtest
+```
+
+Preview the look-away blur, no headphones needed. Launching through `open` makes it use pinlock's own Screen Recording permission, not your terminal's:
+
+```sh
+open -n pinlock.app --args --peektest
 ```
 
 Run the self-test with `./pinlock.app/Contents/MacOS/pinlock --selftest`.
