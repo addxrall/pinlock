@@ -740,6 +740,7 @@ static uint64_t uptimeNs(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     _heartbeat = [NSTimer timerWithTimeInterval:1 repeats:YES block:^(NSTimer *t) {
         gHeartbeat = uptimeNs();
     }];
+    _heartbeat.tolerance = 0.5;
     [NSRunLoop.mainRunLoop addTimer:_heartbeat forMode:NSRunLoopCommonModes];
 
     _watchdog = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
@@ -1128,7 +1129,7 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
     NSUInteger _peekGen;
     int _peekSide;
     NSArray<NSArray<CALayer *> *> *_peekMasks;
-    NSTimer *_peekTimer;
+    id _peekTimer;
     double _peekProgress;
     NSTimeInterval _peekLast;
     NSMenuItem *_lookStatus;
@@ -1148,9 +1149,24 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
                                                 selector:@selector(awayTick:)
                                                 userInfo:nil
                                                  repeats:YES];
+    _awayTimer.tolerance = 1;
     _noNap = [NSProcessInfo.processInfo
         beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep
                           reason:@"Lock When Away"];
+}
+
+- (void)stopBluetooth {
+    if (_probing) [self finishProbe];
+    [_bt stopScan];
+    _bt.delegate = nil;
+    _bt = nil;
+    [_awayTimer invalidate];
+    _awayTimer = nil;
+    if (_noNap) [NSProcessInfo.processInfo endActivity:_noNap];
+    _noNap = nil;
+    _seen = nil;
+    _peripherals = nil;
+    _models = nil;
 }
 
 - (void)centralManagerDidUpdateState:(CBCentralManager *)c {
@@ -1169,6 +1185,7 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
     BOOL chosen = awayDevices()[k.UUIDString] != nil, apple = isApple(ad);
     if (chosen) awaySeen(&_away, rssi.integerValue, awayRSSI(), now);
     if (chosen && _calibration && rssi.integerValue < 0) [_calibration addObject:rssi];
+    if (!_radarTimer) return;
 
     NSDictionary *old = _seen[k];
     NSString *name = p.name ?: ad[CBAdvertisementDataLocalNameKey];
@@ -1331,6 +1348,7 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
 - (void)windowWillClose:(NSNotification *)n {
     [_radarTimer invalidate];
     _radarTimer = nil;
+    if (!awayDevices().count) [self stopBluetooth];
 }
 
 - (void)refreshAway:(NSTimer *)t {
@@ -1609,12 +1627,21 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
 - (void)startPeekTimer {
     if (_peekTimer) return;
     _peekLast = NSProcessInfo.processInfo.systemUptime;
+    if (@available(macOS 14.0, *)) {
+        NSView *v = _peekWindows.firstObject.contentView;
+        CADisplayLink *link = [v displayLinkWithTarget:self selector:@selector(peekStep:)];
+        float hz = v.window.screen.maximumFramesPerSecond ?: 60;
+        link.preferredFrameRateRange = CAFrameRateRangeMake(60, hz, hz);
+        [link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+        _peekTimer = link;
+        return;
+    }
     _peekTimer = [NSTimer timerWithTimeInterval:1.0 / 60 target:self selector:@selector(peekStep:)
                                        userInfo:nil repeats:YES];
     [NSRunLoop.mainRunLoop addTimer:_peekTimer forMode:NSRunLoopCommonModes];
 }
 
-- (void)peekStep:(NSTimer *)t {
+- (void)peekStep:(id)t {
     NSTimeInterval now = NSProcessInfo.processInfo.systemUptime, dt = now - _peekLast;
     _peekLast = now;
     _peekProgress = _peekOn ? MIN(1, _peekProgress + dt / kPeekIn) : MAX(0, _peekProgress - dt / kPeekOut);
