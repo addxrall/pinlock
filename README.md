@@ -38,7 +38,8 @@ If a feature acts as if a permission is missing even though System Settings show
 
 ## Usage
 
-- Set a PIN on first launch (at least 4 digits). Change it from the menu bar item.
+- Set a PIN on first launch (at least 4 digits). Change it from the menu bar item. It is kept in your login keychain, not in pinlock's preferences.
+- After 5 wrong PINs the lock screen makes you wait before the next try: 30 s, then twice as long each time, up to 15 minutes. From the 10th wrong PIN on, each one also locks the Mac properly, as **⌃⌘Q** does. **Use Mac Password** is never delayed. A correct unlock resets the count.
 - Lock with **⌃⌥⌘L** or **Lock Now** in the menu.
 - Blur, cover strength and cover colour are configurable from the menu.
 - Forgot the PIN? Click **Use Mac Password** on the lock screen and enter your macOS account password.

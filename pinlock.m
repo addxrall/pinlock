@@ -7,6 +7,8 @@
 #import <CoreBluetooth/CoreBluetooth.h>
 #import <CoreMotion/CoreMotion.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
+#import <Security/Security.h>
+#import <dlfcn.h>
 #import <stdatomic.h>
 
 static const CGFloat kBlurDefault = 0.6;
@@ -273,12 +275,60 @@ static BOOL macPasswordOK(NSString *password) {
            [(CBUserIdentity *)me authenticateWithPassword:password];
 }
 
-static NSString *currentPIN(void) {
-    return [NSUserDefaults.standardUserDefaults stringForKey:@"pin"];
+static NSString *gPIN;
+
+static NSDictionary *pinQuery(void) {
+    return @{(id)kSecClass: (id)kSecClassGenericPassword,
+             (id)kSecAttrService: @"pinlock",
+             (id)kSecAttrAccount: @"pin"};
 }
 
-static void setPIN(NSString *pin) {
-    [NSUserDefaults.standardUserDefaults setObject:pin forKey:@"pin"];
+static BOOL setPIN(NSString *pin) {
+    gPIN = pin;
+    SecItemDelete((__bridge CFDictionaryRef)pinQuery());
+    NSMutableDictionary *q = pinQuery().mutableCopy;
+    q[(id)kSecValueData] = [pin dataUsingEncoding:NSUTF8StringEncoding];
+    OSStatus err = SecItemAdd((__bridge CFDictionaryRef)q, NULL);
+    if (err) NSLog(@"pinlock: saving the PIN to the keychain failed (%d)", (int)err);
+    return err == errSecSuccess;
+}
+
+// Read once and cached, so a keychain prompt can never end up behind the shield.
+static NSString *currentPIN(void) {
+    if (gPIN) return gPIN;
+    NSMutableDictionary *q = pinQuery().mutableCopy;
+    q[(id)kSecReturnData] = @YES;
+    CFTypeRef data = NULL;
+    if (SecItemCopyMatching((__bridge CFDictionaryRef)q, &data) == errSecSuccess)
+        gPIN = [[NSString alloc] initWithData:CFBridgingRelease(data) encoding:NSUTF8StringEncoding];
+
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    NSString *old = [d stringForKey:@"pin"];
+    if (old && (gPIN || setPIN(old))) [d removeObjectForKey:@"pin"];
+    return gPIN ?: old;
+}
+
+static const NSUInteger kFreeTries = 5, kSystemLockAfter = 10;
+static NSUInteger gFailures;
+static NSTimeInterval gRetryAt;
+
+static NSTimeInterval pinDelay(NSUInteger failures) {
+    return failures < kFreeTries ? 0 : MIN(30 * pow(2, failures - kFreeTries), 15 * 60);
+}
+
+static NSTimeInterval pinWait(void) { return gRetryAt - NSProcessInfo.processInfo.systemUptime; }
+
+// The same lock as ⌃⌘Q. Private API, so a missing symbol is just skipped.
+static void systemLock(void) {
+    void *h = dlopen("/System/Library/PrivateFrameworks/login.framework/login", RTLD_LAZY);
+    int (*lock)(void) = h ? dlsym(h, "SACLockScreenImmediate") : NULL;
+    if (lock) lock();
+}
+
+static void pinFailed(void) {
+    gFailures++;
+    gRetryAt = NSProcessInfo.processInfo.systemUptime + pinDelay(gFailures);
+    if (gFailures >= kSystemLockAfter) systemLock();
 }
 
 static BOOL promptForPIN(NSString *title, NSString *info) {
@@ -413,6 +463,10 @@ static void selfTest(void) {
     NSCAssert([pinDigits(@"1234567", 4) isEqualToString:@"1234"], @"input must stop at PIN length");
     NSCAssert([pinDigits(@"", 4) isEqualToString:@""], @"empty stays empty");
 
+    NSCAssert(pinDelay(kFreeTries - 1) == 0, @"the first tries are free");
+    NSCAssert(pinDelay(kFreeTries) == 30 && pinDelay(kFreeTries + 1) == 60, @"the delay doubles");
+    NSCAssert(pinDelay(1000) == 15 * 60, @"the delay is capped");
+
     printf("selftest ok\n");
 }
 
@@ -488,6 +542,7 @@ static void selfTest(void) {
     NSSecureTextField *_field, *_pass;
     NSArray<PinBox *> *_boxes;
     NSStackView *_row;
+    NSTextField *_hint;
     NSButton *_mode;
 }
 
@@ -545,7 +600,10 @@ static void selfTest(void) {
     _mode.contentTintColor = NSColor.secondaryLabelColor;
     _mode.refusesFirstResponder = YES;
 
-    NSStackView *stack = [NSStackView stackViewWithViews:@[avatar, name, row, _mode]];
+    _hint = [NSTextField labelWithString:@""];
+    _hint.textColor = NSColor.secondaryLabelColor;
+
+    NSStackView *stack = [NSStackView stackViewWithViews:@[avatar, name, row, _hint, _mode]];
     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
     stack.alignment = NSLayoutAttributeCenterX;
     stack.spacing = 18;
@@ -580,10 +638,23 @@ static void selfTest(void) {
         b.active = i == len;
         b.needsDisplay = YES;
     }];
+    int wait = ceil(pinWait());
+    _hint.stringValue = wait > 0 && _pass.hidden
+        ? [NSString stringWithFormat:@"Too many tries. Try again in %d:%02d", wait / 60, wait % 60]
+        : @"";
+}
+
+- (void)tick {
+    [self refresh];
+    if (pinWait() <= 0) return;
+    __weak PinPanel *weak = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        [weak tick];
+    });
 }
 
 - (void)controlTextDidChange:(NSNotification *)n {
-    NSString *pin = pinDigits(_field.stringValue, _boxes.count);
+    NSString *pin = pinWait() > 0 ? @"" : pinDigits(_field.stringValue, _boxes.count);
     if (![pin isEqualToString:_field.stringValue]) _field.stringValue = pin;
     [self refresh];
     // Deferred so the last box paints before unlock/shake, and so unlock
@@ -599,12 +670,14 @@ static void selfTest(void) {
 }
 
 - (void)submit:(id)sender {
+    if (pinWait() > 0) return;
     if ([_field.stringValue isEqualToString:currentPIN()]) {
         [LockController.shared unlock];
         return;
     }
+    if (_field.stringValue.length == _boxes.count) pinFailed();
     _field.stringValue = @"";
-    [self refresh];
+    [self tick];
     [self shake];
 }
 
@@ -786,6 +859,8 @@ static uint64_t uptimeNs(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 - (void)unlock {
     if (!_locked) return;
     _locked = NO;
+    gFailures = 0;
+    gRetryAt = 0;
     [self stopWatchdog];
 
     NSApp.presentationOptions = NSApplicationPresentationDefault;

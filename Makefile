@@ -2,7 +2,7 @@ APP  = pinlock.app
 BIN  = $(APP)/Contents/MacOS/pinlock
 FW   = -framework Cocoa -framework IOKit -framework Collaboration \
        -framework QuartzCore -framework ServiceManagement -framework Carbon -framework CoreBluetooth \
-       -framework CoreMotion -weak_framework ScreenCaptureKit
+       -framework CoreMotion -framework Security -weak_framework ScreenCaptureKit
 
 CERT = pinlock dev
 P12  = $${TMPDIR:-/tmp}/pinlock-dev.p12
