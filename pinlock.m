@@ -4,6 +4,8 @@
 #import <IOKit/pwr_mgt/IOPMLib.h>
 #import <ServiceManagement/ServiceManagement.h>
 #import <Carbon/Carbon.h>
+#import <CoreBluetooth/CoreBluetooth.h>
+#import <stdatomic.h>
 
 static const CGFloat kBlurDefault = 0.6;
 
@@ -42,8 +44,45 @@ static NSString *currentTint(void) {
 
 static const CGFloat kDimFloor = 0.02;
 
-static const NSInteger kQuitPresses = 4;
-static const NSTimeInterval kQuitWindow = 2.0;
+// If the main thread stops answering for this long while locked, the
+// watchdog kills the process so a hung pinlock can never trap the user.
+static const uint64_t kStallLimit = 10;
+
+static const NSInteger kAwayRSSIDefault = -70;
+static const NSTimeInterval kAwayDelay = 15;
+
+static NSInteger awayRSSI(void) {
+    NSNumber *v = [NSUserDefaults.standardUserDefaults objectForKey:@"awayRSSI"];
+    return v ? v.integerValue : kAwayRSSIDefault;
+}
+
+// Phone counts as near while any reading is at or above the threshold; lock
+// once no near reading has arrived for kAwayDelay. Fires once per absence, so
+// unlocking with the phone still gone doesn't relock in a loop.
+typedef struct {
+    NSTimeInterval nearAt;
+    BOOL armed;
+} Away;
+
+static void awaySeen(Away *a, NSInteger rssi, NSInteger threshold, NSTimeInterval now) {
+    if (rssi < 0 && rssi >= threshold) {  // CoreBluetooth reports 127 for "unknown"
+        a->nearAt = now;
+        a->armed = YES;
+    }
+}
+
+static BOOL awayDue(Away *a, NSTimeInterval now) {
+    if (!a->armed || now - a->nearAt < kAwayDelay) return NO;
+    a->armed = NO;
+    return YES;
+}
+
+static BOOL macPasswordOK(NSString *password) {
+    CBIdentity *me = [CBIdentity identityWithName:NSUserName()
+                                        authority:CBIdentityAuthority.defaultIdentityAuthority];
+    return [me isKindOfClass:CBUserIdentity.class] &&
+           [(CBUserIdentity *)me authenticateWithPassword:password];
+}
 
 static NSString *currentPIN(void) {
     return [NSUserDefaults.standardUserDefaults stringForKey:@"pin"];
@@ -88,34 +127,23 @@ static NSString *pinDigits(NSString *s, NSUInteger max) {
     return d.length > max ? [d substringToIndex:max] : d;
 }
 
-static BOOL quitGestureComplete(NSTimeInterval now) {
-    static NSInteger presses = 0;
-    static NSTimeInterval last = 0;
-
-    if (now - last > kQuitWindow) presses = 0;
-    last = now;
-
-    if (++presses >= kQuitPresses) {
-        presses = 0;
-        return YES;
-    }
-    return NO;
-}
-
 static void selfTest(void) {
-    NSCAssert(kQuitPresses == 4, @"test assumes a 4-press gesture");
+    NSCAssert(kAwayDelay == 15, @"test assumes a 15 s away delay");
 
-    NSCAssert(!quitGestureComplete(0.0), @"1st press must not quit");
-    NSCAssert(!quitGestureComplete(0.5), @"2nd press must not quit");
-    NSCAssert(!quitGestureComplete(1.0), @"3rd press must not quit");
-    NSCAssert(quitGestureComplete(1.5), @"4th press must quit");
+    Away a = {0};
+    NSCAssert(!awayDue(&a, 100), @"never-seen phone must not lock");
+    awaySeen(&a, 127, -70, 0);
+    NSCAssert(!awayDue(&a, 100), @"RSSI 127 (unknown) must not count as near");
+    awaySeen(&a, -50, -70, 0);
+    NSCAssert(!awayDue(&a, 10), @"must wait the full delay");
+    awaySeen(&a, -85, -70, 12);
+    NSCAssert(awayDue(&a, 16), @"weak-only readings past the delay must lock");
+    NSCAssert(!awayDue(&a, 40), @"must lock only once per absence");
+    awaySeen(&a, -60, -70, 50);
+    NSCAssert(!awayDue(&a, 60), @"back in range must not lock");
+    NSCAssert(awayDue(&a, 66), @"leaving again must lock again");
 
-    NSCAssert(!quitGestureComplete(10.0), @"after reset, 1st press must not quit");
-    NSCAssert(!quitGestureComplete(10.5), @"2nd press must not quit");
-    NSCAssert(!quitGestureComplete(99.0), @"stale press must restart the count, not quit");
-    NSCAssert(!quitGestureComplete(99.5), @"2nd of new run must not quit");
-    NSCAssert(!quitGestureComplete(100.0), @"3rd of new run must not quit");
-    NSCAssert(quitGestureComplete(100.5), @"4th of new run must quit");
+    NSCAssert(!macPasswordOK(@""), @"empty password must be rejected");
 
     NSCAssert([pinDigits(@"12a3", 6) isEqualToString:@"123"], @"non-digits must be dropped");
     NSCAssert([pinDigits(@"1234567", 4) isEqualToString:@"1234"], @"input must stop at PIN length");
@@ -124,7 +152,11 @@ static void selfTest(void) {
     printf("selftest ok\n");
 }
 
-@class PinPanel;
+@interface PinPanel : NSViewController <NSTextFieldDelegate>
+// Whichever field is taking input: the PIN field or the Mac password field.
+@property (nonatomic, readonly) NSSecureTextField *field;
+- (void)shake;
+@end
 
 #pragma mark - Controller
 
@@ -147,12 +179,12 @@ static void selfTest(void) {
 @end
 
 @interface ShieldView : NSView
-@property (nonatomic, weak) NSTextField *field;
+@property (nonatomic, weak) PinPanel *panel;
 @end
 
 @implementation ShieldView
 
-- (void)mouseDown:(NSEvent *)e { [self.window makeFirstResponder:self.field]; }
+- (void)mouseDown:(NSEvent *)e { [self.window makeFirstResponder:self.panel.field]; }
 - (void)rightMouseDown:(NSEvent *)e {}
 - (void)otherMouseDown:(NSEvent *)e {}
 - (void)scrollWheel:(NSEvent *)e {}
@@ -188,16 +220,15 @@ static void selfTest(void) {
 
 @end
 
-@interface PinPanel : NSViewController <NSTextFieldDelegate>
-@property (nonatomic, readonly) NSSecureTextField *field;
-- (void)shake;
-@end
-
 @implementation PinPanel {
     NSVisualEffectView *_blur;
-    NSSecureTextField *_field;
+    NSSecureTextField *_field, *_pass;
     NSArray<PinBox *> *_boxes;
+    NSStackView *_row;
+    NSButton *_mode;
 }
+
+- (NSSecureTextField *)field { return _pass.hidden ? _field : _pass; }
 
 - (void)loadView {
     _blur = [[NSVisualEffectView alloc] initWithFrame:NSMakeRect(0, 0, 300, 320)];
@@ -224,7 +255,7 @@ static void selfTest(void) {
     NSMutableArray<PinBox *> *boxes = [NSMutableArray array];
     for (NSUInteger i = 0; i < currentPIN().length; i++) [boxes addObject:[PinBox new]];
     _boxes = boxes;
-    NSStackView *row = [NSStackView stackViewWithViews:boxes];
+    NSStackView *row = _row = [NSStackView stackViewWithViews:boxes];
     row.spacing = 8;
 
     _field = [[NSSecureTextField alloc] initWithFrame:NSZeroRect];
@@ -237,13 +268,31 @@ static void selfTest(void) {
     _field.nextKeyView = _field;
     _field.translatesAutoresizingMaskIntoConstraints = NO;
 
-    NSStackView *stack = [NSStackView stackViewWithViews:@[avatar, name, row]];
+    // Fallback for a forgotten PIN: the macOS account password, shown in
+    // place of the boxes. The row only fades (not hidden) so the overlay
+    // constraints above stay put.
+    _pass = [[NSSecureTextField alloc] initWithFrame:NSZeroRect];
+    _pass.placeholderString = @"Mac password";
+    _pass.bezelStyle = NSTextFieldRoundedBezel;
+    _pass.hidden = YES;
+    _pass.target = self;
+    _pass.action = @selector(submitPassword:);
+    _pass.nextKeyView = _pass;
+    _pass.translatesAutoresizingMaskIntoConstraints = NO;
+
+    _mode = [NSButton buttonWithTitle:@"Use Mac Password" target:self action:@selector(toggleMode:)];
+    _mode.bordered = NO;
+    _mode.contentTintColor = NSColor.secondaryLabelColor;
+    _mode.refusesFirstResponder = YES;
+
+    NSStackView *stack = [NSStackView stackViewWithViews:@[avatar, name, row, _mode]];
     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
     stack.alignment = NSLayoutAttributeCenterX;
     stack.spacing = 18;
     stack.translatesAutoresizingMaskIntoConstraints = NO;
     [_blur addSubview:stack];
     [_blur addSubview:_field];
+    [_blur addSubview:_pass];
 
     CGFloat rowWidth = boxes.count * 44.0 - 8;
     [NSLayoutConstraint activateConstraints:@[
@@ -253,6 +302,9 @@ static void selfTest(void) {
         [_field.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
         [_field.topAnchor constraintEqualToAnchor:row.topAnchor],
         [_field.bottomAnchor constraintEqualToAnchor:row.bottomAnchor],
+        [_pass.centerXAnchor constraintEqualToAnchor:row.centerXAnchor],
+        [_pass.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+        [_pass.widthAnchor constraintEqualToConstant:220],
         [stack.centerXAnchor constraintEqualToAnchor:_blur.centerXAnchor],
         [stack.centerYAnchor constraintEqualToAnchor:_blur.centerYAnchor],
         [_blur.widthAnchor constraintEqualToConstant:MAX(300, rowWidth + 60)],
@@ -296,6 +348,37 @@ static void selfTest(void) {
     [self shake];
 }
 
+- (void)toggleMode:(id)sender {
+    BOOL toPassword = _pass.hidden;
+    _pass.hidden = !toPassword;
+    _field.hidden = toPassword;
+    _row.alphaValue = toPassword ? 0 : 1;
+    _field.stringValue = _pass.stringValue = @"";
+    [self refresh];
+    _mode.title = toPassword ? @"Use PIN" : @"Use Mac Password";
+    [self.view.window makeFirstResponder:self.field];
+}
+
+- (void)submitPassword:(id)sender {
+    NSString *password = _pass.stringValue;
+    _pass.stringValue = @"";
+    _pass.enabled = NO;
+    // Off the main thread: opendirectoryd can be slow (and throttles after
+    // failures), and a stalled main thread would trip the watchdog.
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        BOOL ok = macPasswordOK(password);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_pass.enabled = YES;
+            if (ok) {
+                [LockController.shared unlock];
+                return;
+            }
+            [self.view.window makeFirstResponder:self->_pass];
+            [self shake];
+        });
+    });
+}
+
 - (void)shake {
     CAKeyframeAnimation *a = [CAKeyframeAnimation animationWithKeyPath:@"position.x"];
     CGFloat x = _blur.layer.position.x;
@@ -308,10 +391,44 @@ static void selfTest(void) {
 
 #pragma mark - Controller impl
 
+static _Atomic uint64_t gHeartbeat;
+
+static uint64_t uptimeNs(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }  // stops during sleep
+
 @implementation LockController {
     NSMutableArray<NSWindow *> *_windows;
     PinPanel *_panel;
     IOPMAssertionID _assertion;
+    NSTimer *_heartbeat;
+    dispatch_source_t _watchdog;
+}
+
+// The PIN, the password and the menu all live on the main thread, so if it
+// hangs nothing can unlock. A background thread watches a main-thread
+// heartbeat and exits the process; WindowServer then drops the shield and
+// the presentation options with it.
+- (void)startWatchdog {
+    gHeartbeat = uptimeNs();
+    _heartbeat = [NSTimer timerWithTimeInterval:1 repeats:YES block:^(NSTimer *t) {
+        gHeartbeat = uptimeNs();
+    }];
+    [NSRunLoop.mainRunLoop addTimer:_heartbeat forMode:NSRunLoopCommonModes];
+
+    _watchdog = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    dispatch_source_set_timer(_watchdog, DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC, NSEC_PER_SEC / 2);
+    dispatch_source_set_event_handler(_watchdog, ^{
+        uint64_t beat = gHeartbeat;  // read before the clock, so now >= beat
+        if (uptimeNs() - beat > kStallLimit * NSEC_PER_SEC) _exit(70);
+    });
+    dispatch_resume(_watchdog);
+}
+
+- (void)stopWatchdog {
+    [_heartbeat invalidate];
+    _heartbeat = nil;
+    if (_watchdog) dispatch_source_cancel(_watchdog);
+    _watchdog = nil;
 }
 
 + (instancetype)shared {
@@ -389,7 +506,7 @@ static void selfTest(void) {
                 [p.centerXAnchor constraintEqualToAnchor:shield.centerXAnchor],
                 [p.centerYAnchor constraintEqualToAnchor:shield.centerYAnchor],
             ]];
-            shield.field = _panel.field;
+            shield.panel = _panel;
             keyWindow = w;
         }
         [w orderFrontRegardless];
@@ -406,6 +523,7 @@ static void selfTest(void) {
                                 NSApplicationPresentationDisableForceQuit |
                                 NSApplicationPresentationDisableSessionTermination |
                                 NSApplicationPresentationDisableHideApplication;
+    [self startWatchdog];
 }
 
 - (void)nudge { [_panel shake]; }
@@ -413,6 +531,7 @@ static void selfTest(void) {
 - (void)unlock {
     if (!_locked) return;
     _locked = NO;
+    [self stopWatchdog];
 
     NSApp.presentationOptions = NSApplicationPresentationDefault;
     NSApp.activationPolicy = NSApplicationActivationPolicyAccessory;
@@ -439,13 +558,131 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
     return noErr;
 }
 
-@interface Delegate : NSObject <NSApplicationDelegate, NSMenuDelegate>
+@interface Delegate : NSObject <NSApplicationDelegate, NSMenuDelegate, CBCentralManagerDelegate>
 @end
 
 @implementation Delegate {
     NSStatusItem *_item;
     NSMenuItem *_login;
-    NSMenu *_blurMenu, *_dimMenu, *_tintMenu;
+    NSMenu *_blurMenu, *_dimMenu, *_tintMenu, *_awayMenu, *_distanceMenu;
+    CBCentralManager *_bt;
+    NSMutableDictionary<NSUUID *, NSDictionary *> *_seen;  // id -> {name, rssi, at}
+    NSTimer *_awayTimer;
+    id<NSObject> _noNap;
+    Away _away;
+}
+
+#pragma mark Lock When Away
+
+// Created lazily: the first CBCentralManager triggers the Bluetooth
+// permission prompt, which nobody who skips this feature should see.
+- (void)startBluetooth {
+    if (_bt) return;
+    _seen = [NSMutableDictionary dictionary];
+    _bt = [[CBCentralManager alloc] initWithDelegate:self queue:nil];
+    _awayTimer = [NSTimer scheduledTimerWithTimeInterval:2
+                                                  target:self
+                                                selector:@selector(awayTick:)
+                                                userInfo:nil
+                                                 repeats:YES];
+    // App Nap would stretch the timer and delay the lock by minutes.
+    _noNap = [NSProcessInfo.processInfo
+        beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep
+                          reason:@"Lock When Away"];
+}
+
+- (void)centralManagerDidUpdateState:(CBCentralManager *)c {
+    if (c.state == CBManagerStatePoweredOn)
+        [c scanForPeripheralsWithServices:nil
+                                  options:@{CBCentralManagerScanOptionAllowDuplicatesKey: @YES}];
+}
+
+- (void)centralManager:(CBCentralManager *)c
+    didDiscoverPeripheral:(CBPeripheral *)p
+        advertisementData:(NSDictionary<NSString *, id> *)ad
+                     RSSI:(NSNumber *)rssi {
+    NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    NSString *name = p.name ?: ad[CBAdvertisementDataLocalNameKey] ?: _seen[p.identifier][@"name"];
+    _seen[p.identifier] = @{@"name": name ?: @"", @"rssi": rssi, @"at": @(now)};
+
+    if ([p.identifier.UUIDString isEqualToString:
+                                  [NSUserDefaults.standardUserDefaults stringForKey:@"awayID"]])
+        awaySeen(&_away, rssi.integerValue, awayRSSI(), now);
+}
+
+- (void)awayTick:(NSTimer *)t {
+    NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    // Random BLE addresses keep minting new ids; forget anything stale.
+    for (NSUUID *k in _seen.allKeys)
+        if (now - [_seen[k][@"at"] doubleValue] > 30) [_seen removeObjectForKey:k];
+
+    if (awayDue(&_away, now)) [LockController.shared lock];
+}
+
+- (void)buildAwayMenu {
+    [_awayMenu removeAllItems];
+    NSString *chosen = [NSUserDefaults.standardUserDefaults stringForKey:@"awayID"];
+
+    NSMenuItem *off = [_awayMenu addItemWithTitle:@"Off" action:@selector(pickAway:) keyEquivalent:@""];
+    off.target = self;
+    off.state = chosen ? NSControlStateValueOff : NSControlStateValueOn;
+    [_awayMenu addItem:NSMenuItem.separatorItem];
+
+    if (_bt.state != CBManagerStatePoweredOn) {
+        [_awayMenu addItemWithTitle:_bt.state == CBManagerStateUnauthorized
+                                        ? @"Bluetooth access denied (System Settings › Privacy)"
+                                        : @"Waiting for Bluetooth…"
+                             action:nil
+                      keyEquivalent:@""];
+    } else {
+        [_awayMenu addItemWithTitle:@"Hold your iPhone next to the Mac and pick the strongest:"
+                             action:nil
+                      keyEquivalent:@""];
+    }
+
+    NSArray<NSUUID *> *ids = [_seen keysSortedByValueUsingComparator:^(NSDictionary *a, NSDictionary *b) {
+        return [b[@"rssi"] compare:a[@"rssi"]];
+    }];
+    if (ids.count > 8) ids = [ids subarrayWithRange:NSMakeRange(0, 8)];
+
+    BOOL chosenListed = NO;
+    for (NSUUID *k in ids) {
+        NSString *name = [_seen[k][@"name"] length] ? _seen[k][@"name"]
+                                                    : [@"Unnamed " stringByAppendingString:[k.UUIDString substringToIndex:4]];
+        NSMenuItem *it = [_awayMenu addItemWithTitle:[NSString stringWithFormat:@"%@   %@ dBm", name, _seen[k][@"rssi"]]
+                                              action:@selector(pickAway:)
+                                       keyEquivalent:@""];
+        it.target = self;
+        it.representedObject = @[k.UUIDString, name];
+        if ([k.UUIDString isEqualToString:chosen]) {
+            it.state = NSControlStateValueOn;
+            chosenListed = YES;
+        }
+    }
+    if (chosen && !chosenListed) {
+        NSString *name = [NSUserDefaults.standardUserDefaults stringForKey:@"awayName"];
+        NSMenuItem *it = [_awayMenu addItemWithTitle:[name stringByAppendingString:@"   (out of range)"]
+                                              action:nil
+                                       keyEquivalent:@""];
+        it.state = NSControlStateValueOn;
+    }
+
+    [_awayMenu addItem:NSMenuItem.separatorItem];
+    _distanceMenu = [self levelMenu:@[@"Close", @"Medium", @"Far"]
+                               tags:@[@-60, @-70, @-80]
+                             action:@selector(setAwayRSSI:)];
+    [_awayMenu addItemWithTitle:@"Distance" action:nil keyEquivalent:@""].submenu = _distanceMenu;
+}
+
+- (void)pickAway:(NSMenuItem *)sender {
+    NSArray<NSString *> *v = sender.representedObject;  // nil for "Off": nil removes both keys
+    [NSUserDefaults.standardUserDefaults setObject:v[0] forKey:@"awayID"];
+    [NSUserDefaults.standardUserDefaults setObject:v[1] forKey:@"awayName"];
+    _away = (Away){0};
+}
+
+- (void)setAwayRSSI:(NSMenuItem *)sender {
+    [NSUserDefaults.standardUserDefaults setInteger:sender.tag forKey:@"awayRSSI"];
 }
 
 - (NSMenu *)levelMenu:(NSArray<NSString *> *)titles
@@ -498,34 +735,29 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
                              action:@selector(toggleLogin:)
                       keyEquivalent:@""];
     _login.target = self;
+
+    _awayMenu = [NSMenu new];
+    _awayMenu.delegate = self;
+    [menu addItemWithTitle:@"Lock When Away" action:nil keyEquivalent:@""].submenu = _awayMenu;
+
     [menu addItem:NSMenuItem.separatorItem];
     [menu addItemWithTitle:@"Quit pinlock" action:@selector(quit:) keyEquivalent:@"q"].target = self;
     _item.menu = menu;
 
     [self registerHotKey];
 
-    __block NSInteger presses = 0;
-    __block NSTimeInterval last = 0;
     [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown
                                           handler:^NSEvent *(NSEvent *e) {
-        if (!((e.modifierFlags & NSEventModifierFlagCommand) &&
-              [e.charactersIgnoringModifiers.lowercaseString isEqualToString:@"q"]))
-            return e;
-
-        if (kQuitPresses <= 0) return nil;
-        if (e.isARepeat) return nil;
-
-        if (e.timestamp - last > kQuitWindow) presses = 0;
-        last = e.timestamp;
-
-        if (++presses >= kQuitPresses) {
-            presses = 0;
-            [NSApp terminate:nil];
-        } else {
+        if (LockController.shared.locked &&
+            (e.modifierFlags & NSEventModifierFlagCommand) &&
+            [e.charactersIgnoringModifiers.lowercaseString isEqualToString:@"q"]) {
             [LockController.shared nudge];
+            return nil;
         }
-        return nil;
+        return e;
     }];
+
+    if ([NSUserDefaults.standardUserDefaults stringForKey:@"awayID"]) [self startBluetooth];
 
     if (!currentPIN())
         promptForPIN(@"Set a PIN",
@@ -533,6 +765,18 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
 }
 
 - (void)menuWillOpen:(NSMenu *)menu {
+    if (menu == _awayMenu) {
+        [self startBluetooth];
+        [self buildAwayMenu];
+        return;
+    }
+
+    if (menu == _distanceMenu) {
+        for (NSMenuItem *it in menu.itemArray)
+            it.state = it.tag == awayRSSI() ? NSControlStateValueOn : NSControlStateValueOff;
+        return;
+    }
+
     if (menu == _blurMenu || menu == _dimMenu) {
         NSInteger cur = lround((menu == _blurMenu ? blurStrength() : dimStrength()) * 100);
         for (NSMenuItem *it in menu.itemArray)
@@ -623,7 +867,16 @@ int main(int argc, const char *argv[]) {
         del = [Delegate new];
         NSApp.delegate = del;
 
-        if (argc > 1) {
+        if (argc > 1 && strcmp(argv[1], "--hangtest") == 0) {
+            // Lock, then freeze the main thread: the watchdog must exit the
+            // process within kStallLimit. If it doesn't, unlock after 30 s.
+            dispatch_async(dispatch_get_main_queue(), ^{ [LockController.shared lock]; });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+                           dispatch_get_main_queue(), ^{
+                sleep(30);
+                [LockController.shared unlock];
+            });
+        } else if (argc > 1) {
             double secs = atof(argv[1]);
             dispatch_async(dispatch_get_main_queue(), ^{ [LockController.shared lock]; });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(secs * NSEC_PER_SEC)),

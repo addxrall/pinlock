@@ -20,6 +20,8 @@
 	<string>11.0</string>
 	<key>LSUIElement</key>
 	<true/>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>pinlock locks the screen when your iPhone moves away from the Mac.</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 </dict>

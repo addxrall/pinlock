@@ -1,7 +1,7 @@
 APP  = pinlock.app
 BIN  = $(APP)/Contents/MacOS/pinlock
 FW   = -framework Cocoa -framework IOKit -framework Collaboration \
-       -framework QuartzCore -framework ServiceManagement -framework Carbon
+       -framework QuartzCore -framework ServiceManagement -framework Carbon -framework CoreBluetooth
 
 .PHONY: all install uninstall clean
 
