@@ -50,6 +50,7 @@ static const uint64_t kStallLimit = 10;
 
 static const NSInteger kAwayRSSIDefault = -70;
 static const NSTimeInterval kAwayDelay = 15;
+static const NSInteger kDistances[] = {-60, -70, -80};  // Close, Medium, Far
 
 static NSInteger awayRSSI(void) {
     NSNumber *v = [NSUserDefaults.standardUserDefaults objectForKey:@"awayRSSI"];
@@ -75,6 +76,12 @@ static BOOL awayDue(Away *a, NSTimeInterval now) {
     if (!a->armed || now - a->nearAt < kAwayDelay) return NO;
     a->armed = NO;
     return YES;
+}
+
+static BOOL isApple(NSDictionary *ad) {
+    NSData *m = ad[CBAdvertisementDataManufacturerDataKey];
+    const uint8_t *b = m.bytes;
+    return m.length >= 2 && b[0] == 0x4C && b[1] == 0x00;  // Bluetooth SIG company id 0x004C
 }
 
 static BOOL macPasswordOK(NSString *password) {
@@ -142,6 +149,12 @@ static void selfTest(void) {
     awaySeen(&a, -60, -70, 50);
     NSCAssert(!awayDue(&a, 60), @"back in range must not lock");
     NSCAssert(awayDue(&a, 66), @"leaving again must lock again");
+
+    NSString *key = CBAdvertisementDataManufacturerDataKey;
+    NSCAssert(isApple(@{key: [NSData dataWithBytes:(uint8_t[]){0x4C, 0x00, 0x10} length:3]}), @"Apple id must match");
+    NSCAssert(!isApple(@{key: [NSData dataWithBytes:(uint8_t[]){0x06, 0x00} length:2]}), @"other vendors must not");
+    NSCAssert(!isApple(@{key: [NSData dataWithBytes:(uint8_t[]){0x4C} length:1]}), @"short data must not");
+    NSCAssert(!isApple(@{}), @"no manufacturer data must not");
 
     NSCAssert(!macPasswordOK(@""), @"empty password must be rejected");
 
@@ -548,6 +561,198 @@ static uint64_t uptimeNs(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 
 @end
 
+#pragma mark - Radar
+
+static NSString *deviceSymbol(NSString *name) {
+    for (NSArray<NSString *> *m in @[@[@"Watch", @"applewatch"], @[@"iPad", @"ipad"],
+                                     @[@"AirPods", @"airpods"], @[@"Mac", @"laptopcomputer"],
+                                     @[@"iPhone", @"iphone"]])
+        if ([name containsString:m[0]]) return m[1];
+    return @"questionmark.square.dashed";
+}
+
+@interface RadarTile : NSAccessibilityElement
+@property (nonatomic, copy) void (^press)(void);
+@end
+
+@implementation RadarTile
+- (BOOL)accessibilityPerformPress {
+    self.press();
+    return YES;
+}
+@end
+
+// The Mac sits in the middle and each nearby Apple device sits as far out as
+// its signal is weak. The dashed ring is the Distance setting: past it = away.
+@interface RadarView : NSView
+@property (nonatomic, copy) NSArray<NSDictionary *> *devices;  // {id, name, rssi}
+@property (nonatomic, copy) NSString *chosen;
+@property (nonatomic) NSInteger threshold;
+@property (nonatomic, copy) void (^onPick)(NSString *uuid, NSString *name);
+@end
+
+@implementation RadarView {
+    NSMutableDictionary<NSString *, NSNumber *> *_radius;  // smoothed: RSSI jumps a lot
+    NSString *_hover;
+}
+
+- (instancetype)initWithFrame:(NSRect)f {
+    if ((self = [super initWithFrame:f])) {
+        _radius = [NSMutableDictionary dictionary];
+        [self addTrackingArea:[[NSTrackingArea alloc]
+                                  initWithRect:NSZeroRect
+                                       options:NSTrackingMouseMoved | NSTrackingMouseEnteredAndExited |
+                                               NSTrackingActiveAlways | NSTrackingInVisibleRect
+                                         owner:self
+                                      userInfo:nil]];
+    }
+    return self;
+}
+
+- (CGFloat)radiusFor:(NSInteger)rssi {
+    CGFloat inner = 48, outer = NSWidth(self.bounds) / 2 - 40;
+    CGFloat t = MIN(MAX((-40.0 - rssi) / 55.0, 0), 1);  // -40 dBm at the Mac, -95 dBm at the edge
+    return inner + (outer - inner) * t;
+}
+
+- (void)setDevices:(NSArray<NSDictionary *> *)devices {
+    _devices = [devices copy];
+    NSMutableDictionary *next = [NSMutableDictionary dictionary];
+    for (NSDictionary *d in devices) {
+        CGFloat target = [self radiusFor:[d[@"rssi"] integerValue]];
+        NSNumber *old = _radius[d[@"id"]];
+        next[d[@"id"]] = @(old ? old.doubleValue + (target - old.doubleValue) * 0.15 : target);
+    }
+    _radius = next;
+    self.needsDisplay = YES;
+}
+
+- (NSRect)tileFor:(NSDictionary *)d {
+    // ponytail: angle from the id hash, so tiles can overlap; spread them if that bites.
+    CGFloat a = ([d[@"id"] hash] % 360) * M_PI / 180, r = _radius[d[@"id"]].doubleValue;
+    NSPoint c = NSMakePoint(NSMidX(self.bounds) + cos(a) * r, NSMidY(self.bounds) + sin(a) * r);
+    return NSMakeRect(c.x - 15, c.y - 20, 30, 40);
+}
+
+- (void)drawSymbol:(NSString *)name size:(CGFloat)size color:(NSColor *)color in:(NSRect)r {
+    NSImage *img = [[NSImage imageWithSystemSymbolName:name accessibilityDescription:nil]
+        imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:size
+                                                                                    weight:NSFontWeightMedium]];
+    NSImage *tinted = [NSImage imageWithSize:img.size flipped:NO drawingHandler:^BOOL(NSRect b) {
+        [img drawInRect:b];
+        [color set];
+        NSRectFillUsingOperation(b, NSCompositingOperationSourceAtop);
+        return YES;
+    }];
+    NSSize s = img.size;
+    [tinted drawInRect:NSMakeRect(NSMidX(r) - s.width / 2, NSMidY(r) - s.height / 2, s.width, s.height)];
+}
+
+- (void)drawText:(NSString *)text color:(NSColor *)color below:(NSRect)r {
+    if (text.length > 14) text = [[text substringToIndex:13] stringByAppendingString:@"…"];
+    NSDictionary *attr = @{NSFontAttributeName: [NSFont systemFontOfSize:10 weight:NSFontWeightMedium],
+                           NSForegroundColorAttributeName: color};
+    NSSize s = [text sizeWithAttributes:attr];
+    [text drawAtPoint:NSMakePoint(NSMidX(r) - s.width / 2, NSMinY(r) - s.height - 3) withAttributes:attr];
+}
+
+- (void)drawRect:(NSRect)dirty {
+    NSPoint c = NSMakePoint(NSMidX(self.bounds), NSMidY(self.bounds));
+    NSBezierPath *(^ring)(CGFloat) = ^(CGFloat r) {
+        return [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(c.x - r, c.y - r, 2 * r, 2 * r)];
+    };
+
+    NSBezierPath *edge = ring([self radiusFor:-95] + 24);
+    [[NSColor.labelColor colorWithAlphaComponent:0.04] setFill];
+    [edge fill];
+    [NSColor.separatorColor setStroke];
+    [edge stroke];
+
+    NSBezierPath *lockLine = ring([self radiusFor:_threshold]);
+    CGFloat dash[] = {5, 4};
+    [lockLine setLineDash:dash count:2 phase:0];
+    lockLine.lineWidth = 1.5;
+    [NSColor.controlAccentColor setStroke];
+    [lockLine stroke];
+
+    NSRect mac = NSMakeRect(c.x - 30, c.y - 22, 60, 44);
+    NSBezierPath *macBox = [NSBezierPath bezierPathWithRoundedRect:mac xRadius:10 yRadius:10];
+    [NSColor.controlBackgroundColor setFill];
+    [macBox fill];
+    [NSColor.separatorColor setStroke];
+    [macBox stroke];
+    [self drawSymbol:@"laptopcomputer" size:22 color:NSColor.labelColor in:mac];
+    if (!_devices.count) [self drawText:@"Searching…" color:NSColor.secondaryLabelColor below:mac];
+
+    NSColor *green = NSColor.systemGreenColor;
+    for (NSDictionary *d in [self drawOrder]) {
+        BOOL chosen = [d[@"id"] isEqual:_chosen], hover = [d[@"id"] isEqual:_hover];
+        NSRect t = [self tileFor:d];
+        NSBezierPath *box = [NSBezierPath bezierPathWithRoundedRect:t xRadius:8 yRadius:8];
+        [(chosen ? green : [green colorWithAlphaComponent:hover ? 0.4 : 0.2]) setFill];
+        [box fill];
+        box.lineWidth = hover ? 2 : 1;
+        [green setStroke];
+        [box stroke];
+        [self drawSymbol:deviceSymbol(d[@"name"]) size:15 color:chosen ? NSColor.whiteColor : green in:t];
+        [self drawText:d[@"name"] color:chosen ? NSColor.labelColor : NSColor.secondaryLabelColor below:t];
+    }
+}
+
+// Chosen device last, so it is drawn on top and wins clicks.
+- (NSArray<NSDictionary *> *)drawOrder {
+    return [_devices sortedArrayUsingComparator:^(NSDictionary *a, NSDictionary *b) {
+        return [@([a[@"id"] isEqual:self.chosen]) compare:@([b[@"id"] isEqual:self.chosen])];
+    }];
+}
+
+- (NSDictionary *)deviceAt:(NSEvent *)e {
+    NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
+    for (NSDictionary *d in [self drawOrder].reverseObjectEnumerator)
+        if (NSPointInRect(p, NSInsetRect([self tileFor:d], -4, -4))) return d;
+    return nil;
+}
+
+- (void)mouseMoved:(NSEvent *)e {
+    NSDictionary *d = [self deviceAt:e];
+    _hover = d[@"id"];
+    [(d ? NSCursor.pointingHandCursor : NSCursor.arrowCursor) set];
+    self.needsDisplay = YES;
+}
+
+- (void)mouseExited:(NSEvent *)e {
+    _hover = nil;
+    [NSCursor.arrowCursor set];
+    self.needsDisplay = YES;
+}
+
+- (void)mouseDown:(NSEvent *)e {
+    NSDictionary *d = [self deviceAt:e];
+    if (d) self.onPick(d[@"id"], d[@"name"]);
+}
+
+- (BOOL)isAccessibilityElement { return YES; }
+- (NSAccessibilityRole)accessibilityRole { return NSAccessibilityGroupRole; }
+- (NSString *)accessibilityLabel { return @"Nearby devices"; }
+
+- (NSArray *)accessibilityChildren {
+    NSMutableArray *kids = [NSMutableArray array];
+    for (NSDictionary *d in _devices) {
+        RadarTile *t = [RadarTile new];
+        t.accessibilityRole = NSAccessibilityButtonRole;
+        t.accessibilityLabel = [NSString stringWithFormat:@"%@, %@ dBm%@", d[@"name"], d[@"rssi"],
+                                                          [d[@"id"] isEqual:_chosen] ? @", watched" : @""];
+        t.accessibilityParent = self;
+        t.accessibilityFrameInParentSpace = [self tileFor:d];
+        __weak RadarView *weakSelf = self;
+        t.press = ^{ weakSelf.onPick(d[@"id"], d[@"name"]); };
+        [kids addObject:t];
+    }
+    return kids;
+}
+
+@end
+
 #pragma mark - App
 
 static const UInt32 kHotKeyCode = kVK_ANSI_L;
@@ -558,16 +763,22 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
     return noErr;
 }
 
-@interface Delegate : NSObject <NSApplicationDelegate, NSMenuDelegate, CBCentralManagerDelegate>
+@interface Delegate : NSObject <NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate,
+                                CBCentralManagerDelegate>
 @end
 
 @implementation Delegate {
     NSStatusItem *_item;
-    NSMenuItem *_login;
-    NSMenu *_blurMenu, *_dimMenu, *_tintMenu, *_awayMenu, *_distanceMenu;
+    NSMenuItem *_login, *_awayItem;
+    NSMenu *_blurMenu, *_dimMenu, *_tintMenu;
     CBCentralManager *_bt;
     NSMutableDictionary<NSUUID *, NSDictionary *> *_seen;  // id -> {name, rssi, at}
-    NSTimer *_awayTimer;
+    NSTimer *_awayTimer, *_radarTimer;
+    NSWindow *_awayWindow;
+    RadarView *_radar;
+    NSTextField *_awayLabel;
+    NSSegmentedControl *_distance;
+    NSButton *_awayOff;
     id<NSObject> _noNap;
     Away _away;
 }
@@ -602,12 +813,13 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
         advertisementData:(NSDictionary<NSString *, id> *)ad
                      RSSI:(NSNumber *)rssi {
     NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    BOOL chosen = [p.identifier.UUIDString isEqualToString:
+                                           [NSUserDefaults.standardUserDefaults stringForKey:@"awayID"]];
+    if (chosen) awaySeen(&_away, rssi.integerValue, awayRSSI(), now);
+    if (!chosen && !isApple(ad)) return;  // headphones, TVs, the neighbours' kettle
+
     NSString *name = p.name ?: ad[CBAdvertisementDataLocalNameKey] ?: _seen[p.identifier][@"name"];
     _seen[p.identifier] = @{@"name": name ?: @"", @"rssi": rssi, @"at": @(now)};
-
-    if ([p.identifier.UUIDString isEqualToString:
-                                  [NSUserDefaults.standardUserDefaults stringForKey:@"awayID"]])
-        awaySeen(&_away, rssi.integerValue, awayRSSI(), now);
 }
 
 - (void)awayTick:(NSTimer *)t {
@@ -619,70 +831,128 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
     if (awayDue(&_away, now)) [LockController.shared lock];
 }
 
-- (void)buildAwayMenu {
-    [_awayMenu removeAllItems];
+- (NSString *)awayStatus {
+    NSString *chosen = [NSUserDefaults.standardUserDefaults stringForKey:@"awayID"];
+    NSDictionary *s = _seen[[[NSUUID alloc] initWithUUIDString:chosen]];
+    NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    BOOL fresh = s && now - [s[@"at"] doubleValue] < 5;
+    NSInteger rssi = [s[@"rssi"] integerValue];
+
+    if (fresh && rssi >= awayRSSI()) return [NSString stringWithFormat:@"Near · %ld dBm", rssi];
+    if (_away.armed)
+        return [NSString stringWithFormat:@"Moving away · locks in %.0f s",
+                                          MAX(0, kAwayDelay - (now - _away.nearAt))];
+    return fresh ? [NSString stringWithFormat:@"Too far to arm · %ld dBm", rssi] : @"Not in range";
+}
+
+- (void)showAwayWindow:(id)sender {
+    [self startBluetooth];
+    if (!_awayWindow) {
+        _radar = [[RadarView alloc] initWithFrame:NSZeroRect];
+        __weak Delegate *weakSelf = self;
+        _radar.onPick = ^(NSString *uuid, NSString *name) { [weakSelf chooseAway:uuid name:name]; };
+
+        _awayLabel = [NSTextField wrappingLabelWithString:@""];
+        _awayLabel.alignment = NSTextAlignmentCenter;
+        _awayLabel.preferredMaxLayoutWidth = 340;
+
+        _distance = [NSSegmentedControl segmentedControlWithLabels:@[@"Close", @"Medium", @"Far"]
+                                                      trackingMode:NSSegmentSwitchTrackingSelectOne
+                                                            target:self
+                                                            action:@selector(setDistance:)];
+        NSStackView *distanceRow =
+            [NSStackView stackViewWithViews:@[[NSTextField labelWithString:@"Lock beyond"], _distance]];
+
+        _awayOff = [NSButton buttonWithTitle:@"Turn Off" target:self action:@selector(turnAwayOff:)];
+
+        NSStackView *stack = [NSStackView stackViewWithViews:@[_radar, _awayLabel, distanceRow, _awayOff]];
+        stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+        stack.spacing = 14;
+        stack.edgeInsets = NSEdgeInsetsMake(20, 20, 20, 20);
+        [NSLayoutConstraint activateConstraints:@[
+            [_radar.widthAnchor constraintEqualToConstant:340],
+            [_radar.heightAnchor constraintEqualToConstant:340],
+        ]];
+
+        _awayWindow = [[NSWindow alloc] initWithContentRect:NSZeroRect
+                                                  styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+                                                    backing:NSBackingStoreBuffered
+                                                      defer:YES];
+        _awayWindow.title = @"Lock When Away";
+        _awayWindow.releasedWhenClosed = NO;
+        _awayWindow.delegate = self;
+        _awayWindow.contentView = stack;
+        [_awayWindow setContentSize:stack.fittingSize];
+        [_awayWindow center];
+    }
+
+    [self refreshAway:nil];
+    if (!_radarTimer) {
+        _radarTimer = [NSTimer timerWithTimeInterval:0.1
+                                              target:self
+                                            selector:@selector(refreshAway:)
+                                            userInfo:nil
+                                             repeats:YES];
+        [NSRunLoop.mainRunLoop addTimer:_radarTimer forMode:NSRunLoopCommonModes];
+    }
+    [NSApp activateIgnoringOtherApps:YES];
+    [_awayWindow makeKeyAndOrderFront:nil];
+}
+
+- (void)windowWillClose:(NSNotification *)n {
+    [_radarTimer invalidate];
+    _radarTimer = nil;
+}
+
+- (void)refreshAway:(NSTimer *)t {
     NSString *chosen = [NSUserDefaults.standardUserDefaults stringForKey:@"awayID"];
 
-    NSMenuItem *off = [_awayMenu addItemWithTitle:@"Off" action:@selector(pickAway:) keyEquivalent:@""];
-    off.target = self;
-    off.state = chosen ? NSControlStateValueOff : NSControlStateValueOn;
-    [_awayMenu addItem:NSMenuItem.separatorItem];
-
-    if (_bt.state != CBManagerStatePoweredOn) {
-        [_awayMenu addItemWithTitle:_bt.state == CBManagerStateUnauthorized
-                                        ? @"Bluetooth access denied (System Settings › Privacy)"
-                                        : @"Waiting for Bluetooth…"
-                             action:nil
-                      keyEquivalent:@""];
-    } else {
-        [_awayMenu addItemWithTitle:@"Hold your iPhone next to the Mac and pick the strongest:"
-                             action:nil
-                      keyEquivalent:@""];
-    }
-
-    NSArray<NSUUID *> *ids = [_seen keysSortedByValueUsingComparator:^(NSDictionary *a, NSDictionary *b) {
+    NSMutableArray<NSUUID *> *ids = [[_seen keysSortedByValueUsingComparator:^(NSDictionary *a, NSDictionary *b) {
         return [b[@"rssi"] compare:a[@"rssi"]];
-    }];
-    if (ids.count > 8) ids = [ids subarrayWithRange:NSMakeRange(0, 8)];
+    }] mutableCopy];
+    NSUUID *chosenID = chosen ? [[NSUUID alloc] initWithUUIDString:chosen] : nil;
+    if (ids.count > 10) {
+        [ids removeObjectsInRange:NSMakeRange(10, ids.count - 10)];
+        if (_seen[chosenID] && ![ids containsObject:chosenID]) [ids addObject:chosenID];
+    }
 
-    BOOL chosenListed = NO;
+    NSMutableArray *devices = [NSMutableArray array];
     for (NSUUID *k in ids) {
-        NSString *name = [_seen[k][@"name"] length] ? _seen[k][@"name"]
-                                                    : [@"Unnamed " stringByAppendingString:[k.UUIDString substringToIndex:4]];
-        NSMenuItem *it = [_awayMenu addItemWithTitle:[NSString stringWithFormat:@"%@   %@ dBm", name, _seen[k][@"rssi"]]
-                                              action:@selector(pickAway:)
-                                       keyEquivalent:@""];
-        it.target = self;
-        it.representedObject = @[k.UUIDString, name];
-        if ([k.UUIDString isEqualToString:chosen]) {
-            it.state = NSControlStateValueOn;
-            chosenListed = YES;
-        }
+        NSString *name = _seen[k][@"name"];
+        if (!name.length) name = [@"Apple device " stringByAppendingString:[k.UUIDString substringToIndex:4]];
+        [devices addObject:@{@"id": k.UUIDString, @"name": name, @"rssi": _seen[k][@"rssi"]}];
     }
-    if (chosen && !chosenListed) {
-        NSString *name = [NSUserDefaults.standardUserDefaults stringForKey:@"awayName"];
-        NSMenuItem *it = [_awayMenu addItemWithTitle:[name stringByAppendingString:@"   (out of range)"]
-                                              action:nil
-                                       keyEquivalent:@""];
-        it.state = NSControlStateValueOn;
-    }
+    _radar.chosen = chosen;
+    _radar.threshold = awayRSSI();
+    _radar.devices = devices;
 
-    [_awayMenu addItem:NSMenuItem.separatorItem];
-    _distanceMenu = [self levelMenu:@[@"Close", @"Medium", @"Far"]
-                               tags:@[@-60, @-70, @-80]
-                             action:@selector(setAwayRSSI:)];
-    [_awayMenu addItemWithTitle:@"Distance" action:nil keyEquivalent:@""].submenu = _distanceMenu;
+    _awayLabel.stringValue =
+        _bt.state == CBManagerStateUnauthorized
+            ? @"Bluetooth access is off for pinlock. Allow it in System Settings › Privacy & Security › Bluetooth."
+        : _bt.state != CBManagerStatePoweredOn ? @"Waiting for Bluetooth…"
+        : !chosen ? @"Hold your iPhone next to the Mac and click it on the radar."
+                  : [NSString stringWithFormat:@"%@ — %@",
+                                               [NSUserDefaults.standardUserDefaults stringForKey:@"awayName"],
+                                               [self awayStatus]];
+
+    _distance.selectedSegment = -1;
+    for (NSInteger i = 0; i < 3; i++)
+        if (kDistances[i] == awayRSSI()) _distance.selectedSegment = i;
+    _awayOff.enabled = chosen != nil;
 }
 
-- (void)pickAway:(NSMenuItem *)sender {
-    NSArray<NSString *> *v = sender.representedObject;  // nil for "Off": nil removes both keys
-    [NSUserDefaults.standardUserDefaults setObject:v[0] forKey:@"awayID"];
-    [NSUserDefaults.standardUserDefaults setObject:v[1] forKey:@"awayName"];
+- (void)chooseAway:(NSString *)uuid name:(NSString *)name {
+    // nil (Turn Off) removes both keys.
+    [NSUserDefaults.standardUserDefaults setObject:uuid forKey:@"awayID"];
+    [NSUserDefaults.standardUserDefaults setObject:name forKey:@"awayName"];
     _away = (Away){0};
+    [self refreshAway:nil];
 }
 
-- (void)setAwayRSSI:(NSMenuItem *)sender {
-    [NSUserDefaults.standardUserDefaults setInteger:sender.tag forKey:@"awayRSSI"];
+- (void)turnAwayOff:(id)sender { [self chooseAway:nil name:nil]; }
+
+- (void)setDistance:(NSSegmentedControl *)sender {
+    [NSUserDefaults.standardUserDefaults setInteger:kDistances[sender.selectedSegment] forKey:@"awayRSSI"];
 }
 
 - (NSMenu *)levelMenu:(NSArray<NSString *> *)titles
@@ -736,9 +1006,10 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
                       keyEquivalent:@""];
     _login.target = self;
 
-    _awayMenu = [NSMenu new];
-    _awayMenu.delegate = self;
-    [menu addItemWithTitle:@"Lock When Away" action:nil keyEquivalent:@""].submenu = _awayMenu;
+    _awayItem = [menu addItemWithTitle:@"Lock When Away…"
+                                action:@selector(showAwayWindow:)
+                         keyEquivalent:@""];
+    _awayItem.target = self;
 
     [menu addItem:NSMenuItem.separatorItem];
     [menu addItemWithTitle:@"Quit pinlock" action:@selector(quit:) keyEquivalent:@"q"].target = self;
@@ -765,18 +1036,6 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
 }
 
 - (void)menuWillOpen:(NSMenu *)menu {
-    if (menu == _awayMenu) {
-        [self startBluetooth];
-        [self buildAwayMenu];
-        return;
-    }
-
-    if (menu == _distanceMenu) {
-        for (NSMenuItem *it in menu.itemArray)
-            it.state = it.tag == awayRSSI() ? NSControlStateValueOn : NSControlStateValueOff;
-        return;
-    }
-
     if (menu == _blurMenu || menu == _dimMenu) {
         NSInteger cur = lround((menu == _blurMenu ? blurStrength() : dimStrength()) * 100);
         for (NSMenuItem *it in menu.itemArray)
@@ -790,6 +1049,10 @@ static OSStatus onHotKey(EventHandlerCallRef next, EventRef ev, void *ctx) {
                                                                 : NSControlStateValueOff;
         return;
     }
+
+    _awayItem.state = [NSUserDefaults.standardUserDefaults stringForKey:@"awayID"]
+                          ? NSControlStateValueOn
+                          : NSControlStateValueOff;
 
     if (@available(macOS 13.0, *))
         _login.state = SMAppService.mainAppService.status == SMAppServiceStatusEnabled
