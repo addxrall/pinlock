@@ -77,3 +77,7 @@ open -n pinlock.app --args --peektest
 ```
 
 Run the self-test with `./pinlock.app/Contents/MacOS/pinlock --selftest`.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
