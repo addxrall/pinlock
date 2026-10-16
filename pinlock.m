@@ -318,6 +318,11 @@ static NSTimeInterval pinDelay(NSUInteger failures) {
 
 static NSTimeInterval pinWait(void) { return gRetryAt - NSProcessInfo.processInfo.systemUptime; }
 
+static BOOL systemLocked(void) {
+    NSDictionary *s = CFBridgingRelease(CGSessionCopyCurrentDictionary());
+    return [s[@"CGSSessionScreenIsLocked"] boolValue];
+}
+
 // The same lock as ⌃⌘Q. Private API, so a missing symbol is just skipped.
 static void systemLock(void) {
     void *h = dlopen("/System/Library/PrivateFrameworks/login.framework/login", RTLD_LAZY);
@@ -768,23 +773,22 @@ static uint64_t uptimeNs(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 }
 
 - (instancetype)init {
-    if ((self = [super init])) _windows = [NSMutableArray array];
+    if (!(self = [super init])) return nil;
+    _windows = [NSMutableArray array];
+    [NSNotificationCenter.defaultCenter addObserverForName:NSApplicationDidChangeScreenParametersNotification
+                                                    object:nil
+                                                     queue:NSOperationQueue.mainQueue
+                                                usingBlock:^(NSNotification *n) {
+        if (self->_locked) [self showShields];
+    }];
     return self;
 }
 
-- (void)lock {
-    if (_locked) return;
-
-    if (!currentPIN() &&
-        !promptForPIN(@"Set a PIN", @"pinlock needs a PIN before it can lock the screen."))
-        return;
-
-    _locked = YES;
-
-    IOPMAssertionCreateWithName(kIOPMAssertPreventUserIdleDisplaySleep,
-                                kIOPMAssertionLevelOn, CFSTR("pinlock"), &_assertion);
-
-    _panel = [PinPanel new];
+// Rebuilt whenever the displays change, so every screen stays fully covered.
+- (void)showShields {
+    for (NSWindow *w in _windows) [w close];
+    [_windows removeAllObjects];
+    [_panel.view removeFromSuperview];
     NSWindow *keyWindow = nil;
 
     for (NSScreen *scr in NSScreen.screens) {
@@ -842,10 +846,26 @@ static uint64_t uptimeNs(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         [_windows addObject:w];
     }
 
-    NSApp.activationPolicy = NSApplicationActivationPolicyRegular;
-    [NSApp activateIgnoringOtherApps:YES];
     [keyWindow makeKeyAndOrderFront:nil];
     [keyWindow makeFirstResponder:_panel.field];
+}
+
+- (void)lock {
+    if (_locked || systemLocked()) return;
+
+    if (!currentPIN() &&
+        !promptForPIN(@"Set a PIN", @"pinlock needs a PIN before it can lock the screen."))
+        return;
+
+    _locked = YES;
+
+    IOPMAssertionCreateWithName(kIOPMAssertPreventUserIdleDisplaySleep,
+                                kIOPMAssertionLevelOn, CFSTR("pinlock"), &_assertion);
+
+    _panel = [PinPanel new];
+    NSApp.activationPolicy = NSApplicationActivationPolicyRegular;
+    [NSApp activateIgnoringOtherApps:YES];
+    [self showShields];
     NSApp.presentationOptions = NSApplicationPresentationHideDock |
                                 NSApplicationPresentationHideMenuBar |
                                 NSApplicationPresentationDisableProcessSwitching |
